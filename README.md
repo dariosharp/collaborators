@@ -15,14 +15,11 @@ real time.
 +----------------------+------------------+
 ```
 
-## Demo
+## Example
 
-A recorded session lives in [`demo.cast`](demo.cast) (an
-[asciinema](https://asciinema.org/) recording). Play it locally with:
+Here's what a running session looks like:
 
-```sh
-asciinema play demo.cast
-```
+![Example session](example-session.png)
 
 ## Why
 
