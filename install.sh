@@ -1,0 +1,156 @@
+#!/bin/sh
+# install.sh — installer for the claude-team orchestrator.
+#
+#   curl -fsSL https://raw.githubusercontent.com/dariosharp/collaborators/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/dariosharp/collaborators/main/install.sh | bash
+#
+# It asks whether the team should use tmux or screen by default, fetches the
+# tool, and installs a `start-team` command that launches with your chosen
+# terminal. Non-interactive? Pass --tmux/--screen or set TEAM_BACKEND.
+set -eu
+
+REPO="dariosharp/collaborators"
+BRANCH="main"
+CLONE_URL="https://github.com/$REPO.git"
+TARBALL="https://github.com/$REPO/archive/refs/heads/$BRANCH.tar.gz"
+
+INSTALL_DIR="${CLAUDE_TEAM_HOME:-$HOME/.local/share/claude-team}"
+BIN_DIR="${CLAUDE_TEAM_BIN:-$HOME/.local/bin}"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/claude-team"
+CONFIG_FILE="$CONFIG_DIR/config"
+
+log()  { printf '%s\n' "$*"; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ---- backend from args / env (skips the prompt when provided) --------------
+BACKEND="${TEAM_BACKEND:-}"
+for a in "$@"; do
+  case "$a" in
+    -s|--screen|--terminal=screen) BACKEND=screen ;;
+    -t|--tmux|--terminal=tmux)     BACKEND=tmux ;;
+    --terminal=*)                  BACKEND="${a#*=}" ;;
+    -h|--help)
+      log "usage: install.sh [--tmux|--screen]"; exit 0 ;;
+    *) log "unknown option: $a" ; exit 1 ;;
+  esac
+done
+
+# ---- detect installed multiplexers ----------------------------------------
+has_tmux=no; has_screen=no
+have tmux   && has_tmux=yes
+have screen && has_screen=yes
+
+# ---- choose the default backend -------------------------------------------
+if [ -z "$BACKEND" ]; then
+  def=tmux
+  [ "$has_tmux" = no ] && [ "$has_screen" = yes ] && def=screen
+  if [ -r /dev/tty ]; then
+    log ""
+    log "Which terminal multiplexer should the team use by default?"
+    log "  1) tmux    (installed: $has_tmux)"
+    log "  2) screen  (installed: $has_screen)"
+    printf "Choose 1/2 [default: %s]: " "$def" > /dev/tty
+    read ans < /dev/tty || ans=""
+    case "$ans" in
+      1|tmux|t|T)   BACKEND=tmux ;;
+      2|screen|s|S) BACKEND=screen ;;
+      "")           BACKEND="$def" ;;
+      *)            log "unrecognized '$ans' — using $def"; BACKEND="$def" ;;
+    esac
+  else
+    BACKEND="$def"
+    log "Non-interactive install; defaulting to $BACKEND (use --tmux/--screen or TEAM_BACKEND to change)."
+  fi
+fi
+case "$BACKEND" in tmux|screen) ;; *) log "invalid backend: $BACKEND"; exit 1 ;; esac
+
+# warn (don't fail) if the chosen backend isn't installed yet
+eval "chosen_installed=\$has_$BACKEND"
+[ "$chosen_installed" = no ] && \
+  log "WARNING: '$BACKEND' is not installed — install it before running start-team."
+have claude || log "WARNING: the 'claude' CLI was not found on PATH."
+
+# ---- fetch the tool -------------------------------------------------------
+log ""
+log "Installing claude-team to $INSTALL_DIR (backend: $BACKEND)"
+mkdir -p "$BIN_DIR" "$CONFIG_DIR"
+
+# safety: refuse to clobber a non-empty dir that isn't ours
+if [ -d "$INSTALL_DIR" ] && [ -n "$(ls -A "$INSTALL_DIR" 2>/dev/null)" ] \
+   && [ ! -d "$INSTALL_DIR/.git" ] && [ ! -f "$INSTALL_DIR/team/start-team.sh" ]; then
+  log "ERROR: $INSTALL_DIR exists and is not a claude-team install. Set CLAUDE_TEAM_HOME to a free path."
+  exit 1
+fi
+
+fetched=no
+if have git; then
+  if [ -d "$INSTALL_DIR/.git" ]; then
+    log "Updating existing clone ..."
+    git -C "$INSTALL_DIR" pull --ff-only >/dev/null 2>&1 && fetched=yes || fetched=no
+  else
+    tmp="$(mktemp -d)"
+    if git clone --depth 1 --branch "$BRANCH" "$CLONE_URL" "$tmp/repo" >/dev/null 2>&1; then
+      rm -rf "$INSTALL_DIR"; mkdir -p "$(dirname "$INSTALL_DIR")"; mv "$tmp/repo" "$INSTALL_DIR"
+      fetched=yes
+    fi
+    rm -rf "$tmp"
+  fi
+fi
+
+if [ "$fetched" = no ]; then
+  log "Fetching tarball ..."
+  have curl || { log "ERROR: need git or curl to install."; exit 1; }
+  have tar  || { log "ERROR: need tar for the tarball fallback."; exit 1; }
+  tmp="$(mktemp -d)"
+  curl -fsSL "$TARBALL" | tar -xz -C "$tmp"
+  src="$tmp/collaborators-$BRANCH"
+  [ -d "$src" ] || src="$(find "$tmp" -maxdepth 1 -type d -name 'collaborators-*' | head -n1)"
+  [ -d "$src" ] || { log "ERROR: could not find extracted files."; exit 1; }
+  rm -rf "$INSTALL_DIR"; mkdir -p "$(dirname "$INSTALL_DIR")"; mv "$src" "$INSTALL_DIR"
+  rm -rf "$tmp"
+  fetched=yes
+fi
+
+chmod +x "$INSTALL_DIR/team/start-team.sh" "$INSTALL_DIR/team/team.sh" 2>/dev/null || true
+
+# ---- save config ----------------------------------------------------------
+{
+  echo "# claude-team config (edit TEAM_BACKEND to switch, or re-run the installer)"
+  echo "TEAM_BACKEND=$BACKEND"
+  echo "TEAM_HOME=$INSTALL_DIR"
+} > "$CONFIG_FILE"
+log "Saved default backend '$BACKEND' -> $CONFIG_FILE"
+
+# ---- install the start-team launcher --------------------------------------
+LAUNCHER="$BIN_DIR/start-team"
+cat > "$LAUNCHER" <<EOF
+#!/usr/bin/env bash
+# start-team — launcher generated by the claude-team installer.
+# Reads your saved backend and starts the team with the right terminal.
+# Extra args are passed through (e.g. \`start-team --dir=/path\`, or
+# \`start-team --screen\` to override the default just this once).
+set -euo pipefail
+CONFIG_FILE="$CONFIG_FILE"
+TEAM_HOME="$INSTALL_DIR"
+TEAM_BACKEND=tmux
+[ -f "\$CONFIG_FILE" ] && . "\$CONFIG_FILE"
+exec "\$TEAM_HOME/team/start-team.sh" --terminal="\$TEAM_BACKEND" "\$@"
+EOF
+chmod +x "$LAUNCHER"
+log "Installed launcher -> $LAUNCHER"
+
+# ---- PATH advice + done ---------------------------------------------------
+log ""
+log "Done."
+case ":$PATH:" in
+  *":$BIN_DIR:"*) : ;;
+  *)
+    log "Add $BIN_DIR to your PATH, e.g.:"
+    log "  echo 'export PATH=\"$BIN_DIR:\$PATH\"' >> ~/.zshrc && source ~/.zshrc"
+    ;;
+esac
+log ""
+log "Usage:  cd /your/project && start-team"
+log "        start-team --screen     # override backend once"
+log "        start-team --dir=/path  # explicit working directory"
+log "Change the default backend anytime: edit $CONFIG_FILE (TEAM_BACKEND=tmux|screen)."

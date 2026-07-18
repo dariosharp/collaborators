@@ -27,13 +27,31 @@ drives the others and you observe the whole loop.
 - `tmux` **or** GNU `screen`
 - the `claude` CLI on your `PATH`
 
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dariosharp/collaborators/main/install.sh | sh
+```
+
+(`bash` works too.) The installer asks whether the team should use **tmux** or
+**screen** by default, downloads the tool, and installs a `start-team` command on
+your PATH. Non-interactive? Pass the choice up front:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dariosharp/collaborators/main/install.sh | sh -s -- --screen
+# or: TEAM_BACKEND=screen curl -fsSL .../install.sh | sh
+```
+
+The default backend is saved to `~/.config/claude-team/config`; edit it (or
+re-run the installer) to change it later.
+
 ## Quick start
 
 ```bash
-git clone git@github.com:dariosharp/collaborators.git
 cd /path/to/your/project      # the team works in whatever dir you launch from
-/path/to/collaborators/team/start-team.sh          # tmux (default)
-/path/to/collaborators/team/start-team.sh -s       # GNU screen
+start-team                    # uses the backend you chose at install
+start-team --screen           # override the default just this once
+start-team --dir=/some/path   # explicit working directory
 ```
 
 Three panes open, a `claude` starts in each, and the Lead loads its playbook.
