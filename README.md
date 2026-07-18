@@ -90,11 +90,24 @@ by default the directory you launch from (override with `--dir=PATH` or
 
 | Flag / env | Effect |
 |------------|--------|
+| `--workers N` / `TEAM_WORKERS=N` | Number of Worker agents (default 1). |
+| `--testers M` / `TEAM_TESTERS=M` | Number of Tester agents (default 1, may be 0). |
 | `-s`, `--screen`, `--terminal=screen` | Use GNU screen instead of tmux. |
 | `-t`, `--tmux`, `--terminal=tmux` | Force tmux (default). |
-| `--dir=PATH` / `TEAM_WORKDIR=PATH` | Working directory for all three agents. |
-| `AUTO_APPROVE=0` | Make the Worker/Tester ask for permissions like the Lead. |
-| `AGENT_CMD="claude --model …"` | Custom command for the Worker/Tester. |
+| `--dir=PATH` / `TEAM_WORKDIR=PATH` | Working directory for all agents. |
+| `AUTO_APPROVE=0` | Make the Workers/Testers ask for permissions like the Lead. |
+| `AGENT_CMD="claude --model …"` | Custom command for the Workers/Testers. |
+
+### Multiple workers / testers
+
+```bash
+start-team --workers 2 --testers 1   # two workers developing in parallel
+```
+
+The Lead assigns a subtask to each worker and watches them concurrently. Because
+all agents share one directory, the Lead **only parallelizes tasks that touch
+different files** — overlapping edits would clobber each other. tmux auto-tiles
+the pool cleanly; screen support works but is more cramped as the pool grows.
 
 > **Note:** by default the Worker and Tester start with
 > `--dangerously-skip-permissions` so unattended automation doesn't freeze on a

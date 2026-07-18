@@ -1,23 +1,27 @@
 #!/usr/bin/env bash
-# team.sh — the Lead's remote control for the Worker and Tester panes.
+# team.sh — the Lead's remote control for the Worker/Tester panes.
 #
-# Works with either backend (tmux or screen); it reads which one from the
-# state file written by start-team.sh.
+# Agents are addressed by name: lead, worker1, worker2, ..., tester1, tester2, ...
+# ("worker" and "tester" are accepted as aliases for worker1 / tester1.)
+# Works with either backend (tmux or screen), read from the state file.
 #   tmux:   send-keys  (send)  / capture-pane (read)
 #   screen: stuff      (send)  / hardcopy     (read)
 #
 # Usage:
-#   team.sh send   <worker|tester> "<prompt>"      # inline prompt (single line)
-#   team.sh sendf  <worker|tester> <file>          # long/multi-line prompt from a file
-#   team.sh read   <worker|tester|lead> [lines]    # dump the pane's recent output (default 120)
-#   team.sh wait   <worker|tester> [sentinel] [timeout_s]  # block until sentinel appears
-#   team.sh status                                 # show backend + pane map
+#   team.sh send    <agent> "<prompt>"        # inline prompt (single line)
+#   team.sh sendf   <agent> <file>            # long/multi-line prompt from a file
+#   team.sh read    <agent> [lines]           # dump the pane's recent output (default 120)
+#   team.sh check   <agent> [sentinel]        # NON-BLOCKING: exit 0 if done, 1 if still running
+#   team.sh wait    <agent> [sentinel] [timeout_s]   # BLOCK until sentinel appears
+#   team.sh wait-any <agent> <agent> ...      # block until ANY listed agent is done; prints which
+#   team.sh list                              # list all agents and their panes
+#   team.sh status                            # show backend + session
 #
-# Sentinel protocol: end every task prompt with an instruction to print a
-# unique line when finished, e.g. "...When done, print exactly: WORKER_TASK_DONE"
-# then call:  team.sh wait worker
-# (the sentinel defaults to <ROLE>_TASK_DONE, kept symbol-free so it survives
-#  being typed unquoted in zsh.)
+# Sentinel protocol: end every task prompt with an instruction to print a unique
+# line when finished. The sentinel for an agent is <AGENT>_TASK_DONE in caps —
+# e.g. worker2 -> WORKER2_TASK_DONE (symbol-free so it survives unquoted zsh).
+# For parallel work, dispatch to several workers, then poll them with `check` in
+# a loop (or block on `wait-any`).
 
 set -euo pipefail
 
@@ -32,14 +36,35 @@ fi
 # shellcheck disable=SC1090
 source "$PANES_ENV"
 BACKEND="${TEAM_BACKEND:-tmux}"
+WORKERS="${WORKERS:-1}"
+TESTERS="${TESTERS:-1}"
 
-pane_for() {
-  case "$1" in
-    lead|LEAD)     echo "$LEAD_PANE" ;;
-    worker|WORKER) echo "$WORKER_PANE" ;;
-    tester|TESTER) echo "$TESTER_PANE" ;;
-    *) echo "unknown role: $1 (use lead|worker|tester)" >&2; return 1 ;;
+# Canonicalize an agent name: lead | worker<N> | tester<N>
+# ("worker"/"tester" -> worker1/tester1). Prints canonical, or fails.
+canon() {
+  local r; r="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$r" in
+    lead)          echo lead ;;
+    worker)        echo worker1 ;;
+    tester)        echo tester1 ;;
+    worker[0-9]*)  echo "worker${r#worker}" ;;
+    tester[0-9]*)  echo "tester${r#tester}" ;;
+    *) echo "unknown agent: $1 (use lead, worker<N>, tester<N>)" >&2; return 1 ;;
   esac
+}
+
+pane_for() {   # <agent> -> pane id / window number
+  local c var val
+  c="$(canon "$1")" || return 1
+  var="$(printf '%s' "$c" | tr '[:lower:]' '[:upper:]')_PANE"
+  val="${!var:-}"
+  [[ -n "$val" ]] || { echo "no such agent: $1 (not in this team's pane map)" >&2; return 1; }
+  printf '%s' "$val"
+}
+
+sentinel_for() {   # <agent> -> WORKER2_TASK_DONE
+  local c; c="$(canon "$1")" || return 1
+  printf '%s_TASK_DONE' "$(printf '%s' "$c" | tr '[:lower:]' '[:upper:]')"
 }
 
 # ---- backend-specific primitives ------------------------------------------
@@ -71,13 +96,18 @@ _dump() {        # <pane> <lines>  print recent pane output
             for(i=1;i<=n;i++) print a[i]}' "$f" | tail -n "$lines" ;;
   esac
 }
+
+_is_done() {     # <agent> <sentinel> -> 0 if sentinel present, else 1
+  local pane; pane="$(pane_for "$1")" || return 2
+  _dump "$pane" 400 | grep -qF -- "$2"
+}
 # ---------------------------------------------------------------------------
 
 cmd="${1:-}"; shift || true
 
 case "$cmd" in
   send)
-    role="${1:?role required}"; shift
+    role="${1:?agent required}"; shift
     pane="$(pane_for "$role")"
     msg="$*"
     _send_line "$pane" "$msg"
@@ -85,31 +115,37 @@ case "$cmd" in
     ;;
 
   sendf)
-    role="${1:?role required}"; file="${2:?file required}"
+    role="${1:?agent required}"; file="${2:?file required}"
     [[ -f "$file" ]] || { echo "no such file: $file" >&2; exit 1; }
     pane="$(pane_for "$role")"
-    # For long/multi-line tasks, don't blast newlines (each = submit).
-    # Point the agent at the file instead — still one send.
     _send_line "$pane" "Read the file '$file' and carry out the task described in it fully."
     echo "-> $role: pointed at $file (via $BACKEND)"
     ;;
 
   read)
-    role="${1:?role required}"; lines="${2:-120}"
+    role="${1:?agent required}"; lines="${2:-120}"
     pane="$(pane_for "$role")"
     _dump "$pane" "$lines"
     ;;
 
-  wait)
-    role="${1:?role required}"
-    sentinel="${2:-${role^^}_TASK_DONE}"
+  check)   # non-blocking
+    role="${1:?agent required}"
+    sentinel="${2:-$(sentinel_for "$role")}"
+    if _is_done "$role" "$sentinel"; then
+      echo "done: $role"; exit 0
+    else
+      echo "running: $role"; exit 1
+    fi
+    ;;
+
+  wait)    # blocking, single agent
+    role="${1:?agent required}"
+    sentinel="${2:-$(sentinel_for "$role")}"
     timeout="${3:-600}"
-    pane="$(pane_for "$role")"
     elapsed=0
     while (( elapsed < timeout )); do
-      if _dump "$pane" 400 | grep -qF -- "$sentinel"; then
-        echo "OK: '$sentinel' seen after ${elapsed}s"
-        exit 0
+      if _is_done "$role" "$sentinel"; then
+        echo "OK: '$sentinel' seen after ${elapsed}s"; exit 0
       fi
       sleep 3; elapsed=$((elapsed + 3))
     done
@@ -117,17 +153,39 @@ case "$cmd" in
     exit 2
     ;;
 
+  wait-any)  # blocking, returns the first of several agents to finish
+    (( $# >= 1 )) || { echo "wait-any needs at least one agent" >&2; exit 1; }
+    agents=("$@")
+    elapsed=0; timeout=600
+    while (( elapsed < timeout )); do
+      for a in "${agents[@]}"; do
+        if _is_done "$a" "$(sentinel_for "$a")"; then
+          echo "done: $a"; exit 0
+        fi
+      done
+      sleep 3; elapsed=$((elapsed + 3))
+    done
+    echo "TIMEOUT: none of [${agents[*]}] finished within ${timeout}s" >&2
+    exit 2
+    ;;
+
+  list)
+    echo "backend=$BACKEND session=$TEAM_SESSION workers=$WORKERS testers=$TESTERS"
+    echo "  lead    -> $LEAD_PANE"
+    for ((i=1;i<=WORKERS;i++)); do v="WORKER${i}_PANE"; echo "  worker$i -> ${!v:-?}"; done
+    for ((i=1;i<=TESTERS;i++)); do v="TESTER${i}_PANE"; echo "  tester$i -> ${!v:-?}"; done
+    ;;
+
   status)
-    echo "backend=$BACKEND session=$TEAM_SESSION"
-    echo "lead=$LEAD_PANE worker=$WORKER_PANE tester=$TESTER_PANE"
+    echo "backend=$BACKEND session=$TEAM_SESSION workers=$WORKERS testers=$TESTERS"
     ;;
 
   ""|-h|--help|help)
-    sed -n '2,25p' "$HERE/team.sh"
+    sed -n '2,30p' "$HERE/team.sh"
     ;;
 
   *)
-    echo "unknown command: $cmd (try: send sendf read wait status)" >&2
+    echo "unknown command: $cmd (try: send sendf read check wait wait-any list status)" >&2
     exit 1
     ;;
 esac

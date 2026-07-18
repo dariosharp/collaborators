@@ -84,6 +84,11 @@ Tester verify.
 
 ## Notes / knobs
 
+- **Multiple workers/testers:** `start-team --workers 2 --testers 1` (or
+  `TEAM_WORKERS` / `TEAM_TESTERS`). Agents are addressed as `worker1`, `worker2`,
+  `tester1`, … The Lead parallelizes only across tasks that touch **different
+  files** (all agents share one directory). tmux auto-tiles the pool; screen is
+  best-effort and gets cramped with many agents.
 - **Auto-approve:** the Worker and Tester start with
   `--dangerously-skip-permissions` so unattended automation doesn't freeze on
   permission prompts. They run in the same directory as your project, so only use
