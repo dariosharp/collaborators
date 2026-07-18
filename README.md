@@ -15,6 +15,15 @@ real time.
 +----------------------+------------------+
 ```
 
+## Demo
+
+A recorded session lives in [`demo.cast`](demo.cast) (an
+[asciinema](https://asciinema.org/) recording). Play it locally with:
+
+```sh
+asciinema play demo.cast
+```
+
 ## Why
 
 Claude Code's built-in subagents run *inside* the Lead: you get the final result
