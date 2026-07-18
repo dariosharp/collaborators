@@ -24,8 +24,13 @@ drives the others and you observe the whole loop.
 
 ## Requirements
 
+- the **[Claude Code](https://claude.com/claude-code) CLI** (`claude`) on your `PATH`
 - `tmux` **or** GNU `screen`
-- the `claude` CLI on your `PATH`
+- `git` or `curl` (for installing)
+
+> **Claude only.** This tool orchestrates the Claude Code CLI specifically — it
+> launches and drives `claude` processes and is not compatible with other AI
+> agents or CLIs.
 
 ## Install
 

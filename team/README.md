@@ -14,13 +14,30 @@ live in one tmux window.
 
 ## Requirements
 
+- the **[Claude Code](https://claude.com/claude-code) CLI** (`claude`) on your PATH
 - `tmux` **or** GNU `screen` installed
-- `claude` CLI on your PATH
+- `git` or `curl` (for installing)
 
-## Start
+> **Claude only.** This tool launches and drives `claude` processes — it is not
+> compatible with other AI agents or CLIs.
+
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dariosharp/collaborators/main/install.sh | sh
+```
+
+(`bash` works too.) The installer asks whether to use **tmux** or **screen** by
+default and puts a `start-team` command on your PATH. Then just:
 
 ```bash
-cd /home/sdb/Share/Mytest/collaborators
+cd /path/to/your/project
+start-team                        # uses the backend you chose at install
+```
+
+## Start (from a checkout, without installing)
+
+```bash
 ./team/start-team.sh              # tmux (default)
 ./team/start-team.sh -s           # GNU screen  (also: --screen, --terminal=screen)
 ./team/start-team.sh --tmux       # force tmux  (also: --terminal=tmux)
