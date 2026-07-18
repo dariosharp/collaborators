@@ -29,7 +29,7 @@ STATE_DIR="$HERE/.team"
 PANES_ENV="$STATE_DIR/panes.env"
 
 # ---- config (env-overridable) ---------------------------------------------
-SESSION="${TEAM_SESSION:-team}"
+SESSION="${TEAM_SESSION:-}"              # empty -> derived from the working dir
 BACKEND="${TEAM_BACKEND:-tmux}"          # tmux | screen  (overridden by flags)
 WORKDIR="${TEAM_WORKDIR:-$INVOKE_DIR}"   # where the agents operate (default: PWD)
 
@@ -68,12 +68,20 @@ _req_workdir="$WORKDIR"
 WORKDIR="$(cd "$WORKDIR" 2>/dev/null && pwd)" || { echo "working dir does not exist: ${_req_workdir}" >&2; exit 1; }
 QWORKDIR="$(printf '%q' "$WORKDIR")"
 
+# Session name: TEAM_SESSION if set, otherwise the working dir's basename with
+# any characters tmux/screen dislike (., :, spaces, ...) replaced by '_'.
+if [[ -z "$SESSION" ]]; then
+  _base="${WORKDIR##*/}"                 # basename of the working dir
+  SESSION="${_base//[^A-Za-z0-9_-]/_}"   # keep only safe chars
+  [[ -n "$SESSION" ]] || SESSION=team    # fallback (e.g. workdir is "/")
+fi
+
 mkdir -p "$STATE_DIR/tasks"
 
 # One-line bootstrap for the Lead (single line: newlines would submit early).
 BOOTSTRAP="You are the LEAD orchestrator of a 3-agent team; all three of you work in the directory $WORKDIR. Read your playbook at $HERE/ORCHESTRATION.md now, then use $HERE/team.sh to dispatch tasks to the Worker and Tester (running in the other panes) and put any task files under $STATE_DIR/tasks/. After reading, reply READY and wait for my instructions."
 
-echo "backend=$BACKEND  workdir=$WORKDIR"
+echo "backend=$BACKEND  session=$SESSION  workdir=$WORKDIR"
 
 # ===========================================================================
 # tmux backend  (panes get -c "$WORKDIR", so all three start in WORKDIR)
@@ -85,19 +93,23 @@ start_tmux() {
     exec tmux attach -t "$SESSION"
   fi
 
-  tmux new-session -d -s "$SESSION" -n team -c "$WORKDIR"
+  # -P -F prints the id of the pane each command creates — reliable even on a
+  # detached session (unlike display-message without -t).
   local lead worker tester
-  lead="$(tmux display-message -p -t "$SESSION:team" '#{pane_id}')"
-  tmux split-window -h -t "$lead" -c "$WORKDIR"
-  worker="$(tmux display-message -p '#{pane_id}')"
-  tmux split-window -v -t "$worker" -c "$WORKDIR"
-  tester="$(tmux display-message -p '#{pane_id}')"
+  lead="$(tmux new-session -d -s "$SESSION" -n "$SESSION" -c "$WORKDIR" -P -F '#{pane_id}')"
+  worker="$(tmux split-window -h -t "$lead"   -c "$WORKDIR" -P -F '#{pane_id}')"
+  tester="$(tmux split-window -v -t "$worker" -c "$WORKDIR" -P -F '#{pane_id}')"
 
+  # Label each pane by agent. Use a per-pane user option (@role) for the border
+  # text — unlike pane_title, apps/shells can't overwrite it via escape codes.
   tmux set -t "$SESSION" pane-border-status top
-  tmux set -t "$SESSION" pane-border-format ' #{pane_title} '
-  tmux select-pane -t "$lead"   -T "LEAD  (you talk here)"
-  tmux select-pane -t "$worker" -T "WORKER"
-  tmux select-pane -t "$tester" -T "TESTER"
+  tmux set -t "$SESSION" pane-border-format ' #{@role} '
+  tmux set -p -t "$lead"   @role Lead
+  tmux set -p -t "$worker" @role Worker
+  tmux set -p -t "$tester" @role Tester
+  tmux select-pane -t "$lead" -T Lead   # also set the title (harmless fallback)
+  tmux select-pane -t "$worker" -T Worker
+  tmux select-pane -t "$tester" -T Tester
   tmux resize-pane -t "$lead" -x 55% || true
 
   cat > "$PANES_ENV" <<EOF
@@ -138,9 +150,12 @@ start_screen() {
   fi
 
   screen -dmS "$SESSION"
-  screen -S "$SESSION" -p 0 -X title lead
-  screen -S "$SESSION" -X screen -t worker
-  screen -S "$SESSION" -X screen -t tester
+  # Stop the shell/CLI from overwriting our window titles via escape codes.
+  screen -S "$SESSION" -X defdynamictitle off      # default for windows created below
+  screen -S "$SESSION" -p 0 -X dynamictitle off    # for the already-existing window 0
+  screen -S "$SESSION" -p 0 -X title Lead
+  screen -S "$SESSION" -X screen -t Worker
+  screen -S "$SESSION" -X screen -t Tester
 
   cat > "$PANES_ENV" <<EOF
 TEAM_BACKEND=screen

@@ -75,6 +75,10 @@ then dispatches the Tester to verify — and reports back to you.
 | `team/team.sh`       | The Lead's remote control: `send` / `sendf` / `read` / `wait` / `status`. Auto-detects the backend. |
 | `team/ORCHESTRATION.md` | The Lead's playbook — the dispatch → wait → verify loop. |
 
+The session is named after your working directory (e.g. launching in
+`~/test/pippo` creates a session called `pippo`), and the three panes are
+labeled **Lead**, **Worker**, and **Tester**.
+
 The Lead sends prompts with tmux `send-keys` / screen `stuff` and reads output
 back with tmux `capture-pane` / screen `hardcopy`. Each task ends with a
 symbol-free done-sentinel (`WORKER_TASK_DONE` / `TESTER_TASK_DONE`) so the Lead
