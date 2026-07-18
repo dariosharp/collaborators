@@ -1,0 +1,11 @@
+# stray empty scratch file
+/test
+
+# Claude Code machine-local settings
+**/settings.local.json
+
+# team runtime state (recreated on each start-team.sh run)
+team/.team/panes.env
+team/.team/hardcopy.*
+team/.team/tasks/*
+!team/.team/tasks/.gitkeep
