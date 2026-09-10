@@ -38,16 +38,32 @@ WORKDIR="${TEAM_WORKDIR:-$INVOKE_DIR}"   # where the agents operate (default: PW
 WORKERS="${TEAM_WORKERS:-1}"             # how many Worker agents
 TESTERS="${TEAM_TESTERS:-1}"             # how many Tester agents
 
-# The Lead is interactive (you talk to it) → normal permission prompts.
-# Worker/Tester run unattended → skip prompts by default, else automation
-# freezes on the first prompt. AUTO_APPROVE=0 makes them ask like the Lead.
+# All agents (Lead included) run unattended → skip permission prompts by
+# default, else automation freezes on the first prompt. AUTO_APPROVE=0 makes
+# every agent ask for permissions instead.
 AUTO_APPROVE="${AUTO_APPROVE:-1}"
-LEAD_CMD="${LEAD_CMD:-claude}"
-if [[ "$AUTO_APPROVE" == "1" ]]; then
-  AGENT_CMD="${AGENT_CMD:-claude --dangerously-skip-permissions}"
-else
-  AGENT_CMD="${AGENT_CMD:-claude}"
-fi
+_skip=""
+[[ "$AUTO_APPROVE" == "1" ]] && _skip=" --dangerously-skip-permissions"
+
+# Per-role defaults: model + reasoning effort. Override any of these via env
+# (LEAD_CMD / WORKER_CMD / TESTER_CMD). AGENT_CMD, if set, is the fallback for
+# both Workers and Testers (kept for backward compatibility). The permission
+# flag is appended from AUTO_APPROVE above, so overrides needn't include it.
+#   Lead    -> Fable 5.1, effort high
+#   Worker  -> Fable 5.1, effort max
+#   Tester  -> Opus 4.8,  effort xhigh
+LEAD_CMD="${LEAD_CMD:-claude --model claude-fable-5-1 --effort high}${_skip}"
+WORKER_CMD="${WORKER_CMD:-${AGENT_CMD:-claude --model claude-fable-5-1 --effort max}}${_skip}"
+TESTER_CMD="${TESTER_CMD:-${AGENT_CMD:-claude --model claude-opus-4-8 --effort xhigh}}${_skip}"
+
+# worker1 -> $WORKER_CMD, tester1 -> $TESTER_CMD (used when launching each pane)
+cmd_for_role() {
+  case "$1" in
+    worker*) printf '%s' "$WORKER_CMD" ;;
+    tester*) printf '%s' "$TESTER_CMD" ;;
+    *)       printf '%s' "$WORKER_CMD" ;;
+  esac
+}
 # ---------------------------------------------------------------------------
 
 # ---- parse flags ----------------------------------------------------------
@@ -160,8 +176,10 @@ start_tmux() {
   } > "$PANES_ENV"
   echo "Wrote pane map -> $PANES_ENV"
 
-  # launch the CLIs
-  for pane in "${panes[@]}"; do tmux send-keys -t "$pane" "$AGENT_CMD" Enter; done
+  # launch the CLIs (each agent with its role-specific model/effort command)
+  for idx in "${!ROLES[@]}"; do
+    tmux send-keys -t "${panes[$idx]}" "$(cmd_for_role "${ROLES[$idx]}")" Enter
+  done
   tmux send-keys -t "$lead" "$LEAD_CMD" Enter
 
   sleep 6
@@ -211,9 +229,9 @@ start_screen() {
   } > "$PANES_ENV"
   echo "Wrote pane map -> $PANES_ENV"
 
-  # cd + launch each agent window, then the Lead
+  # cd + launch each agent window (role-specific command), then the Lead
   for idx in "${!ROLES[@]}"; do
-    screen_send_raw "$(( idx + 1 ))" "cd $QWORKDIR && $AGENT_CMD"
+    screen_send_raw "$(( idx + 1 ))" "cd $QWORKDIR && $(cmd_for_role "${ROLES[$idx]}")"
   done
   screen_send_raw 0 "cd $QWORKDIR && $LEAD_CMD"
 

@@ -89,11 +89,17 @@ Tester verify.
   `tester1`, … The Lead parallelizes only across tasks that touch **different
   files** (all agents share one directory). tmux auto-tiles the pool; screen is
   best-effort and gets cramped with many agents.
-- **Auto-approve:** the Worker and Tester start with
+- **Auto-approve:** all three agents (Lead, Worker, and Tester) start with
   `--dangerously-skip-permissions` so unattended automation doesn't freeze on
   permission prompts. They run in the same directory as your project, so only use
-  this on code you're OK with them changing. To make them prompt like the Lead:
+  this on code you're OK with them changing. To make every agent prompt instead:
   `AUTO_APPROVE=0 ./team/start-team.sh`.
 - **Different working dir for agents:** `TEAM_WORKDIR=/path ./team/start-team.sh`.
-- **Custom claude command:** `AGENT_CMD="claude --model sonnet-5" ./team/start-team.sh`.
+- **Per-role model / effort:** each role has its own default command —
+  **Lead** `claude --model claude-fable-5-1 --effort high`, **Worker**
+  `claude --model claude-fable-5-1 --effort max`, **Tester**
+  `claude --model claude-opus-4-8 --effort xhigh`. Override any of them with
+  `LEAD_CMD` / `WORKER_CMD` / `TESTER_CMD`, e.g.
+  `WORKER_CMD="claude --model claude-sonnet-5 --effort high" ./team/start-team.sh`.
+  `AGENT_CMD` still works as a fallback for both Worker and Tester.
 - The Lead controls the others via `team/team.sh` (see comments in that file).

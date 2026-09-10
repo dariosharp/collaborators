@@ -101,8 +101,16 @@ by default the directory you launch from (override with `--dir=PATH` or
 | `-s`, `--screen`, `--terminal=screen` | Use GNU screen instead of tmux. |
 | `-t`, `--tmux`, `--terminal=tmux` | Force tmux (default). |
 | `--dir=PATH` / `TEAM_WORKDIR=PATH` | Working directory for all agents. |
-| `AUTO_APPROVE=0` | Make the Workers/Testers ask for permissions like the Lead. |
-| `AGENT_CMD="claude --model …"` | Custom command for the Workers/Testers. |
+| `AUTO_APPROVE=0` | Make all agents (Lead, Workers, Testers) ask for permissions. |
+| `LEAD_CMD="claude --model …"` | Override the Lead command (default: `claude --model claude-fable-5-1 --effort high`). |
+| `WORKER_CMD="claude --model …"` | Override the Worker command (default: `claude --model claude-fable-5-1 --effort max`). |
+| `TESTER_CMD="claude --model …"` | Override the Tester command (default: `claude --model claude-opus-4-8 --effort xhigh`). |
+| `AGENT_CMD="claude --model …"` | Fallback command for both Workers and Testers (overridden by `WORKER_CMD`/`TESTER_CMD`). |
+
+By default each role runs a specific model and reasoning effort — **Lead: Fable
+5.1 (high)**, **Worker: Fable 5.1 (max)**, **Tester: Opus 4.8 (xhigh)** — and the
+`--dangerously-skip-permissions` flag is appended automatically unless
+`AUTO_APPROVE=0`. Override any role with its `*_CMD` variable.
 
 ### Multiple workers / testers
 
@@ -115,10 +123,11 @@ all agents share one directory, the Lead **only parallelizes tasks that touch
 different files** — overlapping edits would clobber each other. tmux auto-tiles
 the pool cleanly; screen support works but is more cramped as the pool grows.
 
-> **Note:** by default the Worker and Tester start with
+> **Note:** by default all three agents (Lead, Worker, and Tester) start with
 > `--dangerously-skip-permissions` so unattended automation doesn't freeze on a
 > permission prompt. They edit files in your working directory — only run this on
-> code you're comfortable having them change.
+> code you're comfortable having them change. Set `AUTO_APPROVE=0` to make every
+> agent prompt for permissions instead.
 
 ## Controls
 
