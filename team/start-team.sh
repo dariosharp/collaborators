@@ -22,6 +22,18 @@
 #   ./start-team.sh -s                                     # GNU screen
 #   ./start-team.sh --screen | --tmux | --terminal=screen
 #   ./start-team.sh --dir=/some/project
+#
+# Resume (-r): bring a closed or crashed team back exactly as you left it —
+# every pane reattached to its own previous conversation.
+#   ./start-team.sh -r                                     # resume this dir's team
+#   ./start-team.sh -r -y                                  # skip the confirmation
+#   ./start-team.sh -r -n                                  # show the plan, start nothing
+# Each agent is launched with a fixed --session-id, recorded in
+# .team/sessions/<team>.env, so -r replays those ids with --resume. For a team
+# started before -r existed there is no record, so -r falls back to identifying
+# each agent's transcript under ~/.claude/projects by the sentinel only that
+# agent was ever told to print, and asks you to confirm. An agent it cannot
+# place — and any role added since the last run — simply starts fresh.
 
 set -euo pipefail
 
@@ -30,6 +42,8 @@ INVOKE_DIR="$PWD"                                    # where you launched from
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" # where the team scripts live
 STATE_DIR="$HERE/.team"
 PANES_ENV="$STATE_DIR/panes.env"
+SESSIONS_DIR="$STATE_DIR/sessions"                   # per-team session-id records
+TEAM_STATE=""                                        # set once SESSION is known
 
 # ---- config (env-overridable) ---------------------------------------------
 SESSION="${TEAM_SESSION:-}"              # empty -> derived from the working dir
@@ -37,6 +51,9 @@ BACKEND="${TEAM_BACKEND:-tmux}"          # tmux | screen  (overridden by flags)
 WORKDIR="${TEAM_WORKDIR:-$INVOKE_DIR}"   # where the agents operate (default: PWD)
 WORKERS="${TEAM_WORKERS:-1}"             # how many Worker agents
 TESTERS="${TEAM_TESTERS:-1}"             # how many Tester agents
+RESUME=0                                 # -r: reattach agents to their old sessions
+ASSUME_YES=0                             # -y: don't ask about a detected mapping
+DRY_RUN=0                                # -n: show what would be launched, then stop
 
 # All agents (Lead included) run unattended → skip permission prompts by
 # default, else automation freezes on the first prompt. AUTO_APPROVE=0 makes
@@ -59,10 +76,188 @@ TESTER_CMD="${TESTER_CMD:-${AGENT_CMD:-claude --model claude-opus-4-8 --effort x
 # worker1 -> $WORKER_CMD, tester1 -> $TESTER_CMD (used when launching each pane)
 cmd_for_role() {
   case "$1" in
+    lead)    printf '%s' "$LEAD_CMD" ;;
     worker*) printf '%s' "$WORKER_CMD" ;;
     tester*) printf '%s' "$TESTER_CMD" ;;
     *)       printf '%s' "$WORKER_CMD" ;;
   esac
+}
+# ---------------------------------------------------------------------------
+
+# ---- resume support -------------------------------------------------------
+# Every agent gets an explicit --session-id at launch, saved to
+# $SESSIONS_DIR/<team>.env. `-r` feeds those ids back as --resume, so each pane
+# reopens its own conversation. We never pass --fork-session: the ids stay
+# stable, which keeps -r repeatable across any number of crashes.
+declare -A SID=()      # role -> session uuid
+declare -A RESUMED=()  # role -> set when that id is an existing conversation
+declare -A SFILE=()    # role -> transcript path, when we detected it
+declare -A SMODEL=()   # role -> model found in that transcript (shown for review)
+
+# Assign a transcript to a role, and remember it so no other role can take it.
+claim() {
+  SID[$1]="$(sid_of "$2")"; RESUMED[$1]=1; SFILE[$1]="$2"
+  SMODEL[$1]="$(transcript_model "$2")"
+}
+taken() {   # already assigned to some role?
+  local o
+  for o in "${!SFILE[@]}"; do
+    if [[ "${SFILE[$o]}" == "$1" ]]; then return 0; fi
+  done
+  return 1
+}
+
+new_uuid() {
+  if [[ -r /proc/sys/kernel/random/uuid ]]; then
+    cat /proc/sys/kernel/random/uuid
+  elif command -v uuidgen >/dev/null 2>&1; then
+    uuidgen | tr '[:upper:]' '[:lower:]'
+  else
+    printf '%08x-%04x-4%03x-8%03x-%04x%08x\n' $((RANDOM*RANDOM)) $((RANDOM%65536)) \
+      $((RANDOM%4096)) $((RANDOM%4096)) $((RANDOM%65536)) $((RANDOM*RANDOM))
+  fi
+}
+
+# Claude keeps a directory's transcripts under ~/.claude/projects/<abs path with
+# every non-alphanumeric character replaced by '-'>.
+project_dir_for() {
+  printf '%s/.claude/projects/%s' "$HOME" "$(printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g')"
+}
+
+sid_of() { local b="${1##*/}"; printf '%s' "${b%.jsonl}"; }
+transcript_model() {   # first model id recorded in a transcript
+  { grep -m1 -o '"model":[[:space:]]*"[^"]*"' "$1" 2>/dev/null || true; } \
+    | head -1 | sed 's/.*"\([^"]*\)"$/\1/'
+}
+
+# Read the ids this team was last started with. Only *_SID lines are parsed —
+# sourcing the file would clobber SESSION/WORKERS/TESTERS for this run.
+load_recorded_sids() {
+  [[ -f "$TEAM_STATE" ]] || return 1
+  local key val role got=0
+  while IFS='=' read -r key val; do
+    [[ "$key" == *_SID && -n "$val" ]] || continue
+    role="$(printf '%s' "${key%_SID}" | tr '[:upper:]' '[:lower:]')"
+    SID[$role]="$val"; RESUMED[$role]=1
+    [[ "$role" == lead ]] && got=1
+  done < "$TEAM_STATE"
+  (( got ))
+}
+
+# Fallback for teams started before -r existed: work out who was who from the
+# transcripts of this working dir. The Lead is the only agent that ever got the
+# bootstrap line; the rest are told apart by the model each role runs.
+detect_sessions() {
+  local pdir; pdir="$(project_dir_for "$WORKDIR")"
+  [[ -d "$pdir" ]] || return 1
+
+  local -a files=(); local f
+  while IFS= read -r f; do [[ -n "$f" ]] && files+=("$f"); done \
+    < <(ls -1t "$pdir"/*.jsonl 2>/dev/null || true)
+  (( ${#files[@]} )) || return 1
+
+  # The Lead is the only agent that ever received the bootstrap line. It must be
+  # identified first: its transcript quotes EVERY agent's sentinel, so leaving it
+  # in the pool below would make it match any role.
+  local lead_file="" f
+  for f in "${files[@]}"; do
+    if grep -qF "You are the LEAD orchestrator" "$f" 2>/dev/null; then lead_file="$f"; break; fi
+  done
+  [[ -n "$lead_file" ]] || return 1
+  claim lead "$lead_file"
+
+  # Strongest signal: each agent's transcript carries the sentinel the Lead told
+  # it to print, and only that one — WORKER2_TASK_DONE only ever reached worker2.
+  local r
+  for r in "${ROLES[@]}"; do
+    for f in "${files[@]}"; do
+      if ! taken "$f" && grep -qF "$(role_upper "$r")_TASK_DONE" "$f" 2>/dev/null; then
+        claim "$r" "$f"; break
+      fi
+    done
+  done
+
+  # A role with no sentinel of its own cannot be pinned down with any confidence,
+  # and the directory may well hold unrelated sessions. Guessing would reattach an
+  # agent to a stranger's conversation, so we leave it unassigned and
+  # plan_sessions gives it a fresh id instead.
+  return 0
+}
+
+show_plan() {
+  local r sid tag when
+  for r in lead "${ROLES[@]}"; do
+    sid="${SID[$r]:-}"
+    if [[ -z "$sid" ]]; then
+      printf '  %-9s %-38s %s\n' "$r" "-" "will start fresh (no previous conversation identified)"
+      continue
+    fi
+    tag="resume"; [[ -n "${RESUMED[$r]:-}" ]] || tag="new session"
+    when=""
+    [[ -n "${SFILE[$r]:-}" && -f "${SFILE[$r]:-}" ]] &&
+      when="   last active $(date -r "${SFILE[$r]}" '+%Y-%m-%d %H:%M')${SMODEL[$r]:+   ${SMODEL[$r]}}"
+    printf '  %-9s %-38s %s%s\n' "$r" "$sid" "$tag" "$when"
+  done
+}
+
+# Decide which session id every pane launches with.
+plan_sessions() {
+  local r ans
+  if (( RESUME )); then
+    if load_recorded_sids; then
+      echo "Resuming team '$SESSION' from $TEAM_STATE"
+      show_plan
+    elif detect_sessions; then
+      echo "No recorded ids for '$SESSION' (team predates -r)."
+      echo "Detected the previous agents in $(project_dir_for "$WORKDIR"):"
+      show_plan
+      if (( ! ASSUME_YES )) && [[ -t 0 ]]; then
+        read -r -p "Resume with this mapping? [Y/n] " ans || ans=""
+        if [[ -n "$ans" && "$ans" != [Yy]* ]]; then
+          echo "Aborted. To pick the ids yourself:" >&2
+          echo "  LEAD_CMD='claude --resume <id> --model claude-fable-5-1 --effort high' \\" >&2
+          echo "  WORKER_CMD='claude --resume <id> ...' start-team ..." >&2
+          exit 1
+        fi
+      fi
+    else
+      echo "-r: nothing to resume for $WORKDIR — starting a fresh team." >&2
+    fi
+  fi
+  # Fresh run, or a role added since the last one: give it a brand-new id.
+  [[ -n "${SID[lead]:-}" ]] || SID[lead]="$(new_uuid)"
+  for r in "${ROLES[@]}"; do
+    [[ -n "${SID[$r]:-}" ]] || SID[$r]="$(new_uuid)"
+  done
+}
+
+# Full CLI for a pane: the role's command plus its session flag. --resume for a
+# conversation that already exists, --session-id to pin a new one.
+launch_cmd() {
+  local role="$1" base flag
+  base="$(cmd_for_role "$role")"
+  if [[ -n "${RESUMED[$role]:-}" ]]; then flag="--resume"; else flag="--session-id"; fi
+  printf '%s %s %s' "$base" "$flag" "${SID[$role]}"
+}
+
+emit_sids() {
+  local r
+  echo "LEAD_SID=${SID[lead]}"
+  for r in "${ROLES[@]}"; do echo "$(role_upper "$r")_SID=${SID[$r]}"; done
+}
+
+# Durable per-team record, so the next -r knows exactly who was who.
+save_team_state() {
+  mkdir -p "$SESSIONS_DIR"
+  {
+    echo "# claude-team — session ids for '$SESSION'. Used by start-team.sh -r."
+    echo "TEAM_SESSION=$SESSION"
+    echo "TEAM_WORKDIR=$WORKDIR"
+    echo "WORKERS=$WORKERS"
+    echo "TESTERS=$TESTERS"
+    emit_sids
+  } > "$TEAM_STATE"
+  echo "Wrote session ids -> $TEAM_STATE"
 }
 # ---------------------------------------------------------------------------
 
@@ -77,7 +272,10 @@ while [[ $# -gt 0 ]]; do
     --testers=*)    TESTERS="${1#*=}" ;;
     --workers)      shift; WORKERS="${1:-}" ;;
     --testers)      shift; TESTERS="${1:-}" ;;
-    -h|--help)      sed -n '2,24p' "$HERE/start-team.sh"; exit 0 ;;
+    -r|--resume)    RESUME=1 ;;
+    -y|--yes)       ASSUME_YES=1 ;;
+    -n|--dry-run)   DRY_RUN=1 ;;
+    -h|--help)      awk 'NR>1{ if ($0 ~ /^set -euo/) exit; print }' "$HERE/start-team.sh"; exit 0 ;;
     *) echo "unknown option: $1 (try -h)" >&2; exit 1 ;;
   esac
   shift
@@ -118,6 +316,10 @@ TOTAL=$(( 1 + ${#ROLES[@]} ))
 role_label() { local k="${1%%[0-9]*}" n="${1##*[!0-9]}"; printf '%s %s' "${k^}" "$n"; }  # worker1 -> "Worker 1"
 role_upper() { printf '%s' "${1^^}"; }                                                    # worker1 -> WORKER1
 
+# Which conversation each pane opens (fresh ids, or the previous ones under -r).
+TEAM_STATE="$SESSIONS_DIR/$SESSION.env"
+plan_sessions
+
 # ---- Lead bootstrap (single line: newlines would submit early) ------------
 if (( WORKERS == 1 && TESTERS == 1 )); then
   ROSTER="one Worker (worker1) and one Tester (tester1)"
@@ -126,7 +328,28 @@ else
 fi
 BOOTSTRAP="You are the LEAD orchestrator. You work in $WORKDIR with $ROSTER, each running in its own pane. Read your playbook at $HERE/ORCHESTRATION.md now, then use $HERE/team.sh to dispatch to agents BY NAME (e.g. worker1, worker2, tester1) with send/sendf/read/check/wait, and put task files under $STATE_DIR/tasks/. Run tasks in parallel across workers only when they touch DIFFERENT files. After reading, reply READY and wait for my instructions."
 
-echo "backend=$BACKEND  session=$SESSION  workdir=$WORKDIR  workers=$WORKERS  testers=$TESTERS"
+# Under -r the Lead is already briefed — it only needs to know it was restarted.
+RESUME_NOTICE="Your team was interrupted and has just been restarted. Your conversation and every agent's are intact, and the pane map has been rewritten, so keep dispatching through $HERE/team.sh BY NAME (e.g. worker1, tester1) exactly as before — nothing else has changed. Any task you had dispatched before the interruption was lost mid-flight, so check each agent with read/check before trusting it finished. Briefly recap where we left off and what is still open, then wait for my instructions."
+
+# Keyed on whether the Lead is really coming back, not on the flag: `-r` with
+# nothing to resume starts a fresh Lead, and that one needs the full briefing.
+if [[ -n "${RESUMED[lead]:-}" ]]; then
+  LEAD_OPENING="$RESUME_NOTICE"
+  OPENING_DELAY="${OPENING_DELAY:-12}"   # replaying a long transcript takes longer
+else
+  LEAD_OPENING="$BOOTSTRAP"
+  OPENING_DELAY="${OPENING_DELAY:-6}"
+fi
+
+echo "backend=$BACKEND  session=$SESSION  workdir=$WORKDIR  workers=$WORKERS  testers=$TESTERS  resume=$RESUME"
+
+if (( DRY_RUN )); then
+  echo "--- dry run: nothing started, no state written ---"
+  for _r in lead "${ROLES[@]}"; do echo "  $_r: $(launch_cmd "$_r")"; done
+  echo "  lead opening message: ${LEAD_OPENING:0:80}... (after ${OPENING_DELAY}s)"
+  echo "  would record ids in: $TEAM_STATE"
+  exit 0
+fi
 
 # ===========================================================================
 # tmux backend  — Lead is the main pane (left); agents tile down the right.
@@ -173,17 +396,19 @@ start_tmux() {
     for idx in "${!ROLES[@]}"; do
       echo "$(role_upper "${ROLES[$idx]}")_PANE=${panes[$idx]}"
     done
+    emit_sids
   } > "$PANES_ENV"
   echo "Wrote pane map -> $PANES_ENV"
+  save_team_state
 
-  # launch the CLIs (each agent with its role-specific model/effort command)
+  # launch the CLIs (role-specific model/effort, pinned to that role's session)
   for idx in "${!ROLES[@]}"; do
-    tmux send-keys -t "${panes[$idx]}" "$(cmd_for_role "${ROLES[$idx]}")" Enter
+    tmux send-keys -t "${panes[$idx]}" "$(launch_cmd "${ROLES[$idx]}")" Enter
   done
-  tmux send-keys -t "$lead" "$LEAD_CMD" Enter
+  tmux send-keys -t "$lead" "$(launch_cmd lead)" Enter
 
-  sleep 6
-  tmux send-keys -t "$lead" -l "$BOOTSTRAP"
+  sleep "$OPENING_DELAY"
+  tmux send-keys -t "$lead" -l "$LEAD_OPENING"
   tmux send-keys -t "$lead" Enter
 
   tmux select-pane -t "$lead"
@@ -226,14 +451,16 @@ start_screen() {
     for idx in "${!ROLES[@]}"; do
       echo "$(role_upper "${ROLES[$idx]}")_PANE=$(( idx + 1 ))"
     done
+    emit_sids
   } > "$PANES_ENV"
   echo "Wrote pane map -> $PANES_ENV"
+  save_team_state
 
   # cd + launch each agent window (role-specific command), then the Lead
   for idx in "${!ROLES[@]}"; do
-    screen_send_raw "$(( idx + 1 ))" "cd $QWORKDIR && $(cmd_for_role "${ROLES[$idx]}")"
+    screen_send_raw "$(( idx + 1 ))" "cd $QWORKDIR && $(launch_cmd "${ROLES[$idx]}")"
   done
-  screen_send_raw 0 "cd $QWORKDIR && $LEAD_CMD"
+  screen_send_raw 0 "cd $QWORKDIR && $(launch_cmd lead)"
 
   screen -S "$SESSION" -X caption always '%{= kw}[%n %t]%{-}'
 
@@ -249,8 +476,8 @@ start_screen() {
   (
     sleep 2
     screen -S "$SESSION" -X eval "${layout[@]}" 2>/dev/null || true
-    sleep 5
-    screen_send_raw 0 "$BOOTSTRAP"
+    sleep "$OPENING_DELAY"
+    screen_send_raw 0 "$LEAD_OPENING"
   ) &
 
   exec screen -r "$SESSION"

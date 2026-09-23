@@ -9,3 +9,5 @@ team/.team/panes.env
 team/.team/hardcopy.*
 team/.team/tasks/*
 !team/.team/tasks/.gitkeep
+team/.team/sessions/*
+!team/.team/sessions/.gitkeep
