@@ -41,6 +41,7 @@ class FakeSession:
         self._n = 0
         self.last_tool_output = ""
         self.commands: list[Command] = list(DEMO_COMMANDS)
+        self.remote_url: str | None = None
 
     @property
     def name(self) -> str:
@@ -55,6 +56,12 @@ class FakeSession:
 
     async def interrupt(self) -> None:
         self._interrupted.set()
+
+    async def set_remote_control(self, enabled: bool, name: str | None = None) -> str | None:
+        await self.pause(0.2)
+        self.remote_url = "https://claude.ai/code/session_demo (demo: not a real link)" \
+            if enabled else None
+        return self.remote_url
 
     async def pause(self, seconds: float) -> None:
         if self.speed > 0:

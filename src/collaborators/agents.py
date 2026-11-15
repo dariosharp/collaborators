@@ -103,6 +103,18 @@ class AgentRunner:
         self.task_id: str | None = None
         self.last_touched: list[str] = []
         self.total_cost = 0.0
+        if hasattr(session, "on_remote"):
+            session.on_remote = self._on_remote  # type: ignore[attr-defined]
+
+    def _on_remote(self, event: Event) -> None:
+        """Events of a turn someone started from claude.ai (Remote Control)."""
+        if self.status is not AgentStatus.RUNNING:
+            self._set_status(AgentStatus.RUNNING)
+        self._emit(event)
+        if isinstance(event, TurnResult):
+            self.total_cost += event.cost_usd
+            if not self.busy:
+                self._set_status(AgentStatus.IDLE)
 
     @property
     def name(self) -> str:
@@ -165,7 +177,7 @@ class AgentRunner:
             return result
 
     async def interrupt(self) -> None:
-        if self.busy:
+        if self.busy or getattr(self.session, "remote_turn", False):
             await self.session.interrupt()
 
     async def close(self) -> None:

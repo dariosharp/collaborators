@@ -33,6 +33,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help=f"model for the {role}")
         p.add_argument(f"--{role}-effort", choices=EFFORTS, default=None,
                        help=f"reasoning effort for the {role}")
+    p.add_argument("--remote-control", action="store_true",
+                   help="make the Lead controllable from claude.ai/code and the Claude app")
     p.add_argument("--demo", action="store_true",
                    help="scripted demo: no API calls, no cost, runs in a temp directory")
     p.add_argument("--version", action="version", version=f"collaborators {__version__}")
@@ -77,7 +79,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from .ui.app import CollabApp
     CollabApp(cfg, backend, resume=args.resume, initial_prompt=initial,
-              mode_label=label).run()
+              mode_label=label, remote_control=args.remote_control).run()
     return 0
 
 

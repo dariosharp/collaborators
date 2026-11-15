@@ -77,7 +77,8 @@ async def test_slash_commands_and_ctrl_c(tmp_path, monkeypatch):
             await pilot.press("/", "c", "o")
             await pilot.pause(0.1)
             assert menu.display
-            assert [c.name for c in menu.commands] == ["code-review", "compact", "context"]
+            assert [c.name for c in menu.commands] == ["code-review", "compact", "context",
+                                                       "remote-control"]
             await pilot.press("down", "tab")
             assert inp.value == "/compact " and not menu.display
             await pilot.press("enter")
@@ -93,22 +94,32 @@ async def test_slash_commands_and_ctrl_c(tmp_path, monkeypatch):
             assert not menu.display  # nothing matches
             inp.value = "/"
             await pilot.pause(0.1)
-            assert menu.display and len(menu.commands) == 7
+            assert menu.display and len(menu.commands) == 8
             await pilot.press("escape")
             assert not menu.display
 
             # unknown commands (and "/ model") are refused instead of being sent
             sent = len(app.backend.sessions["lead"].prompts)
-            for text in ("/remote-control", "/ model"):
+            for text in ("/remote-controll", "/ model"):
                 inp.value = text
                 await pilot.press("escape", "enter")
                 await pilot.pause(0.1)
             assert len(app.backend.sessions["lead"].prompts) == sent
 
+            # /remote-control is handled by collab itself, for the Lead
+            assert app.commands_for("lead")[0].name == "remote-control"
+            lead = app.query_one(LeadPanel)
+            inp.value = "/remote-control"
+            await pilot.press("escape", "enter")
+            await wait_for(pilot, lambda: lead.remote_url is not None)
+            inp.value = "/remote-control off"
+            await pilot.press("enter")
+            await wait_for(pilot, lambda: lead.remote_url is None)
+            assert not any("remote-control" in p for p in app.backend.sessions["lead"].prompts)
+
             # /model X switches the model, and the header follows
             inp.value = "/model claude-opus-4-8"
             await pilot.press("enter")
-            lead = app.query_one(LeadPanel)
             await wait_for(pilot, lambda: lead.model == "claude-opus-4-8")
             assert app.team.runners["lead"].spec.model == "claude-opus-4-8"
 

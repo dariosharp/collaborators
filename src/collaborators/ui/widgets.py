@@ -331,6 +331,7 @@ class LeadPanel(Vertical):
                  commands: Callable[[], list[Command]] = list) -> None:
         super().__init__(id="lead", classes="lead")
         self.commands = commands
+        self.remote_url: str | None = None
         self.model = model
         self.effort = effort
         self.workdir = workdir
@@ -375,6 +376,8 @@ class LeadPanel(Vertical):
                  AgentStatus.IDLE: "ready", AgentStatus.WAITING: "needs approval",
                  AgentStatus.ERROR: "error"}[self.status]
         t.append(f"  {state}", style="italic")
+        if self.remote_url:
+            t.append("  ● remote", style="bold green")
         if self.cost:
             t.append(f"  ${self.cost:.2f}", style="dim")
         self.query_one("#lead-header", Static).update(t)

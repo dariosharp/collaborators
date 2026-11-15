@@ -207,6 +207,7 @@ work streams live into its card.
 | `Ctrl+X` | interrupt the focused agent (the Lead when typing) |
 | `Ctrl+P` | command palette (add or remove agents, themes, …) |
 | `/` | slash commands and skills (yours and the project's): `↑`/`↓` choose, `Tab` completes |
+| `/remote-control` | continue with the Lead from claude.ai/code or the Claude app (`off` to stop) |
 | `↑` / `↓` | browse your previous messages in the Lead input |
 | `F1` | this help |
 | `Ctrl+C` | clear the input; press twice to quit (also `Ctrl+Q`) — `collab --resume` picks up |

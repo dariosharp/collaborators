@@ -42,6 +42,8 @@ from .theme import THEMES
 from .widgets import AgentCard, LeadPanel, StatsBar, TopBar
 
 HISTORY_LIMIT = 3000
+REMOTE_CMD = Command("remote-control", "Control the Lead from claude.ai/code or the Claude "
+                     "app (collab)", "[off]")
 MODEL_SET = re.compile(r"Set model to `([^`]+)`")
 
 
@@ -60,7 +62,8 @@ class CollabApp(App[None]):
     ]
 
     def __init__(self, cfg: TeamConfig, backend: Backend, *, resume: bool = False,
-                 initial_prompt: str = "", mode_label: str = "") -> None:
+                 initial_prompt: str = "", mode_label: str = "",
+                 remote_control: bool = False) -> None:
         super().__init__()
         self.cfg = cfg
         self.backend = backend
@@ -73,6 +76,7 @@ class CollabApp(App[None]):
         self._restart_note = ""
         self._team_stopping = False
         self._last_ctrl_c = 0.0
+        self.remote_control_at_start = remote_control
 
     # ---- layout -----------------------------------------------------------------
     def _summary(self, names: list[str]) -> str:
@@ -122,6 +126,8 @@ class CollabApp(App[None]):
                 "team_status before relying on them.\n\n")
         elif self.resume:
             lead.feed(Notice(LEAD, "Nothing to resume here — started a fresh team.", "warning"))
+        if self.remote_control_at_start:
+            self.set_remote_control(True)
 
     # ---- events from the team ------------------------------------------------------
     def on_team_event(self, event: Event) -> None:
@@ -215,7 +221,35 @@ class CollabApp(App[None]):
     # ---- user actions -------------------------------------------------------------
     def commands_for(self, agent: str) -> list[Command]:
         runner = self.team.runners.get(agent) if self.team is not None else None
-        return runner.commands if runner is not None else []
+        if runner is None:
+            return []
+        extra = [REMOTE_CMD] if agent == LEAD and self.team.remote_control_available else []
+        return extra + [c for c in runner.commands if c.name != REMOTE_CMD.name]
+
+    def set_remote_control(self, enabled: bool) -> None:
+        """Make the Lead reachable from claude.ai/code and the Claude apps (or stop)."""
+        if self.team is None:
+            return
+        lead = self.query_one(LeadPanel)
+
+        async def switch() -> None:
+            assert self.team is not None
+            try:
+                url = await self.team.set_remote_control(enabled)
+            except Exception as exc:
+                lead.feed(Notice(LEAD, f"Remote Control failed: {exc}", "error"))
+                self.notify(str(exc), title="Remote Control", severity="error")
+                return
+            lead.remote_url = url
+            lead._render_header()
+            if enabled:
+                lead.feed(Notice(LEAD, f"Remote Control on — continue from {url} or from "
+                                       "the Claude app. Turn it off with /remote-control off."))
+                self.notify(f"{url}", title="Remote Control on", timeout=10)
+            else:
+                lead.feed(Notice(LEAD, "Remote Control off."))
+
+        self.run_worker(switch(), exit_on_error=False)
 
     def on_lead_panel_submitted(self, message: LeadPanel.Submitted) -> None:
         if self.team is None:
@@ -223,7 +257,10 @@ class CollabApp(App[None]):
         self.query_one(LeadPanel).show_user(message.text)
         if message.text.startswith("/"):
             # A slash command goes to Claude Code exactly as typed.
-            if self.check_command(LEAD, message.text):
+            parts = message.text[1:].split()
+            if parts and parts[0] == REMOTE_CMD.name and self.team.remote_control_available:
+                self.set_remote_control(not (len(parts) > 1 and parts[1] == "off"))
+            elif self.check_command(LEAD, message.text):
                 self.team.tell_lead(message.text)
             return
         self.team.tell_lead(self._restart_note + message.text)
@@ -340,6 +377,11 @@ class CollabApp(App[None]):
                 if name != LEAD:
                     yield SystemCommand(f"Remove {name}", "Take it off the team; the Lead is told",
                                         lambda n=name: self.action_remove_agent(n))
+        if self.team is not None and self.team.remote_control_available:
+            on = bool(self.query_one(LeadPanel).remote_url)
+            yield SystemCommand("Remote Control: " + ("turn off" if on else "turn on"),
+                                "Continue with the Lead from claude.ai/code or the Claude app",
+                                lambda: self.set_remote_control(not on))
         yield SystemCommand("Task board", "Every task with status, cost and report",
                             self.action_tasks)
 

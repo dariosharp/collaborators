@@ -169,6 +169,18 @@ class Team:
                        f"receive tasks.{note}")
         return name
 
+    @property
+    def remote_control_available(self) -> bool:
+        return hasattr(self.runners[LEAD].session, "set_remote_control")
+
+    async def set_remote_control(self, enabled: bool) -> str | None:
+        """Make the Lead controllable from claude.ai/code and the Claude apps."""
+        session: Any = self.runners[LEAD].session
+        if not hasattr(session, "set_remote_control"):
+            raise ValueError("this backend has no Remote Control")
+        name = f"collab · {self.cfg.workdir.name}"
+        return await session.set_remote_control(enabled, name if enabled else None)
+
     def _announce(self, text: str) -> None:
         """Make sure the Lead learns `text`: in its next team-tool result if it is
         working, otherwise as a message as soon as it is idle."""

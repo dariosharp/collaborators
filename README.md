@@ -56,6 +56,7 @@ Then describe what you want, e.g.
 |---|---|
 | `Enter` | send your message to the Lead / open the focused agent |
 | `/` | **Claude Code slash commands and skills** (yours and the project's), with completion: `↑`/`↓` choose, `Tab` completes — to the Lead, or to one agent from its transcript |
+| `/remote-control` | **continue with the Lead from claude.ai/code or the Claude app**; `/remote-control off` stops it (or start with `collab --remote-control`) |
 | `F2` / `F3` | **add a worker / a tester** — the Lead is told immediately and can use it at once |
 | `Delete` | **remove the focused worker or tester** (after a confirmation; a running task is cancelled) |
 | `Tab` | move between the Lead and the agent cards |
@@ -125,6 +126,7 @@ effort = "high"
 collab --workers 3 --testers 2 --tester-effort high --dir ~/code/shop
 collab --ask          # agents ask before running tools; approve with y / a / n
 collab --resume       # reopen every agent's previous conversation here
+collab --remote-control   # reach the Lead from claude.ai/code or your phone too
 ```
 
 > **Permissions:** by default the agents run unattended (`bypassPermissions`) and can
