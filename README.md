@@ -1,42 +1,20 @@
 # collaborators
 
-Run a team of **three Claude Code agents at once — and watch all of them live.**
+**A team of Claude agents — a Lead, Workers and Testers — orchestrated live in one terminal UI.**
 
-You talk to a single **Lead**. The Lead turns your request into a precise task,
-sends it to a **Worker**, then has a **Tester** verify the result — each in its
-own pane of one terminal window, so you see exactly what every agent is doing in
-real time.
+You talk to the **Lead**. It turns your request into precise tasks, dispatches them
+to **Workers**, has **Testers** verify the result, and reports back. Every agent's
+work — its reasoning, each file it reads or edits, each command it runs — streams
+live into its own card.
 
-```
-+----------------------+------------------+
-|                      |     WORKER       |
-|   LEAD  (you type)   +------------------+
-|                      |     TESTER       |
-+----------------------+------------------+
-```
-
-## Example
-
-Here's what a running session looks like:
-
-![Example session](example-session.png)
+![collaborators](docs/screenshot.png)
 
 ## Why
 
-Claude Code's built-in subagents run *inside* the Lead: you get the final result
-but never see the worker think or type. This project instead runs three real
-`claude` processes side by side, so the orchestration is fully visible — the Lead
-drives the others and you observe the whole loop.
-
-## Requirements
-
-- the **[Claude Code](https://claude.com/claude-code) CLI** (`claude`) on your `PATH`
-- `tmux` **or** GNU `screen`
-- `git` or `curl` (for installing)
-
-> **Claude only.** This tool orchestrates the Claude Code CLI specifically — it
-> launches and drives `claude` processes and is not compatible with other AI
-> agents or CLIs.
+Claude Code's built-in subagents run *inside* one session: you get the result, not
+the process. collaborators runs every agent as its own Claude Code session and shows
+them side by side, so the whole loop — plan, implement, verify, fix — is visible and
+steerable.
 
 ## Install
 
@@ -44,98 +22,122 @@ drives the others and you observe the whole loop.
 curl -fsSL https://raw.githubusercontent.com/dariosharp/collaborators/main/install.sh | sh
 ```
 
-(`bash` works too.) The installer asks whether the team should use **tmux** or
-**screen** by default, downloads the tool, and installs a `start-team` command on
-your PATH. Non-interactive? Pass the choice up front:
+The installer uses [uv](https://docs.astral.sh/uv/) or pipx when available, or a
+private virtualenv otherwise. You can also install it directly:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/dariosharp/collaborators/main/install.sh | sh -s -- --screen
-# or: TEAM_BACKEND=screen curl -fsSL .../install.sh | sh
+uv tool install git+https://github.com/dariosharp/collaborators
 ```
 
-The default backend is saved to `~/.config/claude-team/config`; edit it (or
-re-run the installer) to change it later.
+From a clone, `./install.sh` installs that checkout instead (re-run it after pulling
+or changing the code).
+
+Requirements: Python 3.11+, and a [Claude Code](https://claude.com/claude-code) login
+(the agents authenticate the same way Claude Code does).
 
 ## Quick start
 
-```bash
-cd /path/to/your/project      # the team works in whatever dir you launch from
-start-team                    # uses the backend you chose at install
-start-team --screen           # override the default just this once
-start-team --dir=/some/path   # explicit working directory
+```sh
+collab --demo            # a scripted run: no API calls, no cost — look around first
+cd /path/to/project
+collab                   # the team works in the current directory
 ```
 
-Three panes open, a `claude` starts in each, and the Lead loads its playbook.
-When the Lead prints `READY`, just describe what you want, e.g.:
+> Running inside byobu? It takes the function keys: press `Shift+F12` to let F2/F3
+> through, or add agents from the command palette (`Ctrl+P`).
 
-> Add a `--dry-run` flag to the import script and make sure it doesn't write files.
+Then describe what you want, e.g.
 
-The Lead writes a task for the Worker (you see it start), waits for it to finish,
-then dispatches the Tester to verify — and reports back to you.
+> Add a `--dry-run` flag to the import script and make sure it never writes files.
+
+## Keys
+
+| Key | Action |
+|---|---|
+| `Enter` | send your message to the Lead / open the focused agent |
+| `/` | **Claude Code slash commands and skills** (yours and the project's), with completion: `↑`/`↓` choose, `Tab` completes — to the Lead, or to one agent from its transcript |
+| `F2` / `F3` | **add a worker / a tester** — the Lead is told immediately and can use it at once |
+| `Delete` | **remove the focused worker or tester** (after a confirmation; a running task is cancelled) |
+| `Tab` | move between the Lead and the agent cards |
+| `Ctrl+O` | full transcript of the focused agent: diffs, command output, and a direct line to it |
+| `Ctrl+T` | task board: every task, status, verdict, cost, files touched and report |
+| `Ctrl+X` | interrupt the focused agent |
+| `Ctrl+P` | command palette (add or remove agents, task board, themes — dark and light) |
+| `F1` | help |
+| `Ctrl+C` | clear the input; press twice to quit (`Ctrl+Q` works too) — `collab --resume` brings every conversation back |
 
 ## How it works
 
-| Piece | Role |
-|-------|------|
-| `team/start-team.sh` | Builds the 3-pane layout and launches a `claude` in each (tmux or screen). |
-| `team/team.sh`       | The Lead's remote control: `send` / `sendf` / `read` / `wait` / `status`. Auto-detects the backend. |
-| `team/ORCHESTRATION.md` | The Lead's playbook — the dispatch → wait → verify loop. |
+Each agent is a headless Claude Code session driven through the
+[Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk). The Lead coordinates
+through real tools rather than by typing into terminals:
 
-The session is named after your working directory (e.g. launching in
-`~/test/pippo` creates a session called `pippo`), and the three panes are
-labeled **Lead**, **Worker**, and **Tester**.
+| Lead tool | What it does |
+|---|---|
+| `dispatch_task(agent, task, files?)` | start a task on an idle worker or tester; returns a task id |
+| `wait_tasks(ids, mode="all"\|"any")` | wait for tasks and get each report, files modified, cost, warnings |
+| `team_status()` | who is idle or busy, with which task |
+| `cancel_task(id)` | interrupt a task |
 
-The Lead sends prompts with tmux `send-keys` / screen `stuff` and reads output
-back with tmux `capture-pane` / screen `hardcopy`. Each task ends with a
-symbol-free done-sentinel (`WORKER_TASK_DONE` / `TESTER_TASK_DONE`) so the Lead
-knows when an agent has finished. All three agents share one working directory —
-by default the directory you launch from (override with `--dir=PATH` or
-`TEAM_WORKDIR`).
+- **Completion is exact.** A task is done when its session returns its result. No
+  screen scraping.
+- **The team stays in sync.** When you add or remove an agent, the Lead learns about
+  it straight away. If it is blocked in `wait_tasks`, the call returns early with the news, so the
+  new agent can be used right away.
+- **Parallel work is guarded.** Workers share the directory, so the Lead declares the
+  files a task will touch. A task that would overlap a running one is refused, and if
+  two tasks do write the same file anyway, both reports carry a warning.
+- **Skills work everywhere.** Every agent loads your user and project settings and
+  skills: they use skills on their own, and you can run any `/command` yourself.
+- **The Lead cannot edit code.** It is denied the editing tools: it plans, delegates
+  and verifies.
+- **Testers report a verdict.** Each one starts its report with `VERDICT: PASS` or
+  `FAIL`, which shows on its card and on the task board.
+- **State lives in the project.** Session ids and task history are kept in
+  `.collab/`, which ignores itself in git, so `--resume` brings everyone back,
+  including agents you added at runtime (and not the ones you removed).
 
-## Options
+## Configuration
 
-| Flag / env | Effect |
-|------------|--------|
-| `--workers N` / `TEAM_WORKERS=N` | Number of Worker agents (default 1). |
-| `--testers M` / `TEAM_TESTERS=M` | Number of Tester agents (default 1, may be 0). |
-| `-s`, `--screen`, `--terminal=screen` | Use GNU screen instead of tmux. |
-| `-t`, `--tmux`, `--terminal=tmux` | Force tmux (default). |
-| `--dir=PATH` / `TEAM_WORKDIR=PATH` | Working directory for all agents. |
-| `AUTO_APPROVE=0` | Make all agents (Lead, Workers, Testers) ask for permissions. |
-| `LEAD_CMD="claude --model …"` | Override the Lead command (default: `claude --model claude-fable-5-1 --effort high`). |
-| `WORKER_CMD="claude --model …"` | Override the Worker command (default: `claude --model claude-fable-5-1 --effort max`). |
-| `TESTER_CMD="claude --model …"` | Override the Tester command (default: `claude --model claude-opus-4-8 --effort xhigh`). |
-| `AGENT_CMD="claude --model …"` | Fallback command for both Workers and Testers (overridden by `WORKER_CMD`/`TESTER_CMD`). |
+Defaults:
 
-By default each role runs a specific model and reasoning effort — **Lead: Fable
-5.1 (high)**, **Worker: Fable 5.1 (max)**, **Tester: Opus 4.8 (xhigh)** — and the
-`--dangerously-skip-permissions` flag is appended automatically unless
-`AUTO_APPROVE=0`. Override any role with its `*_CMD` variable.
+| Role | Model | Effort |
+|---|---|---|
+| Lead | `claude-fable-5-2` | medium |
+| Worker | `claude-opus-5-5` | medium |
+| Tester | `claude-opus-4-8` | medium |
 
-### Multiple workers / testers
+Override them in `~/.config/collaborators/config.toml` (for every project) or
+`<project>/.collab/config.toml` (for one project). Command-line flags win over both.
 
-```bash
-start-team --workers 2 --testers 1   # two workers developing in parallel
+```toml
+workers = 2
+testers = 1
+permission_mode = "bypassPermissions"   # or acceptEdits, default, auto
+ask = false                              # true: approve tool use from the UI
+
+[worker]
+model = "claude-opus-5-5"
+effort = "high"
 ```
 
-The Lead assigns a subtask to each worker and watches them concurrently. Because
-all agents share one directory, the Lead **only parallelizes tasks that touch
-different files** — overlapping edits would clobber each other. tmux auto-tiles
-the pool cleanly; screen support works but is more cramped as the pool grows.
+```sh
+collab --workers 3 --testers 2 --tester-effort high --dir ~/code/shop
+collab --ask          # agents ask before running tools; approve with y / a / n
+collab --resume       # reopen every agent's previous conversation here
+```
 
-> **Note:** by default all three agents (Lead, Worker, and Tester) start with
-> `--dangerously-skip-permissions` so unattended automation doesn't freeze on a
-> permission prompt. They edit files in your working directory — only run this on
-> code you're comfortable having them change. Set `AUTO_APPROVE=0` to make every
-> agent prompt for permissions instead.
+> **Permissions:** by default the agents run unattended (`bypassPermissions`) and can
+> edit files and run commands in the project directory. Use it on code you are
+> comfortable letting them change, or run with `--ask`.
 
-## Controls
+## Development
 
-**tmux** — switch panes `Ctrl-b`+arrow · detach `Ctrl-b d` · re-attach `tmux attach -t team` · kill `tmux kill-session -t team`
+```sh
+python -m venv .venv && .venv/bin/pip install -e ".[dev]"
+.venv/bin/pytest -q && .venv/bin/ruff check src tests
+.venv/bin/collab --demo
+```
 
-**screen** — switch regions `Ctrl-a Tab` · detach `Ctrl-a d` · re-attach `screen -r team` · kill `screen -S team -X quit`
-
-## More
-
-See [`team/README.md`](team/README.md) for full usage and
-[`team/ORCHESTRATION.md`](team/ORCHESTRATION.md) for the Lead's playbook.
+The test suite drives the orchestrator and the Textual UI through a scripted backend
+(`backend_fake.py`), so it runs offline and costs nothing.

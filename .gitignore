@@ -1,13 +1,15 @@
-# stray empty scratch file
-/test
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# collab's own per-project state, when running it on this repo
+.collab/
 
 # Claude Code machine-local settings
 **/settings.local.json
-
-# team runtime state (recreated on each start-team.sh run)
-team/.team/panes.env
-team/.team/hardcopy.*
-team/.team/tasks/*
-!team/.team/tasks/.gitkeep
-team/.team/sessions/*
-!team/.team/sessions/.gitkeep

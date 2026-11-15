@@ -1,156 +1,70 @@
 #!/bin/sh
-# install.sh — installer for the claude-team orchestrator.
+# install.sh — installs the `collab` command.
 #
 #   curl -fsSL https://raw.githubusercontent.com/dariosharp/collaborators/main/install.sh | sh
-#   curl -fsSL https://raw.githubusercontent.com/dariosharp/collaborators/main/install.sh | bash
 #
-# It asks whether the team should use tmux or screen by default, fetches the
-# tool, and installs a `start-team` command that launches with your chosen
-# terminal. Non-interactive? Pass --tmux/--screen or set TEAM_BACKEND.
+# Run from a clone instead (./install.sh) and it installs that checkout, local
+# changes included.
+#
+# Uses uv if available, then pipx, then a private virtualenv as a fallback.
+# Environment:
+#   COLLAB_REF   git branch/tag to install (default: main)
+#   COLLAB_HOME  virtualenv location for the fallback (default ~/.local/share/collaborators)
+#   COLLAB_BIN   where the fallback links `collab` (default ~/.local/bin)
 set -eu
 
-REPO="dariosharp/collaborators"
-BRANCH="main"
-CLONE_URL="https://github.com/$REPO.git"
-TARBALL="https://github.com/$REPO/archive/refs/heads/$BRANCH.tar.gz"
-
-INSTALL_DIR="${CLAUDE_TEAM_HOME:-$HOME/.local/share/claude-team}"
-BIN_DIR="${CLAUDE_TEAM_BIN:-$HOME/.local/bin}"
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/claude-team"
-CONFIG_FILE="$CONFIG_DIR/config"
+REPO="https://github.com/dariosharp/collaborators"
+REF="${COLLAB_REF:-main}"
+SRC="git+$REPO@$REF"
+# Started as ./install.sh inside a clone (and no COLLAB_REF asked for): install the clone.
+HERE=""
+case "$0" in  # not when piped into sh: $0 is then just "sh"
+  *install.sh) HERE="$(cd "$(dirname "$0")" 2>/dev/null && pwd || true)" ;;
+esac
+if [ -z "${COLLAB_REF:-}" ] && [ -n "$HERE" ] && [ -f "$HERE/pyproject.toml" ] \
+    && grep -q '^name = "collaborators"' "$HERE/pyproject.toml"; then
+  SRC="$HERE"
+  REF="local checkout $HERE"
+fi
+HOME_DIR="${COLLAB_HOME:-$HOME/.local/share/collaborators}"
+BIN_DIR="${COLLAB_BIN:-$HOME/.local/bin}"
 
 log()  { printf '%s\n' "$*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
+die()  { log "error: $*" >&2; exit 1; }
 
-# ---- backend from args / env (skips the prompt when provided) --------------
-BACKEND="${TEAM_BACKEND:-}"
-for a in "$@"; do
-  case "$a" in
-    -s|--screen|--terminal=screen) BACKEND=screen ;;
-    -t|--tmux|--terminal=tmux)     BACKEND=tmux ;;
-    --terminal=*)                  BACKEND="${a#*=}" ;;
-    -h|--help)
-      log "usage: install.sh [--tmux|--screen]"; exit 0 ;;
-    *) log "unknown option: $a" ; exit 1 ;;
-  esac
-done
-
-# ---- detect installed multiplexers ----------------------------------------
-has_tmux=no; has_screen=no
-have tmux   && has_tmux=yes
-have screen && has_screen=yes
-
-# ---- choose the default backend -------------------------------------------
-if [ -z "$BACKEND" ]; then
-  def=tmux
-  [ "$has_tmux" = no ] && [ "$has_screen" = yes ] && def=screen
-  if [ -r /dev/tty ]; then
-    log ""
-    log "Which terminal multiplexer should the team use by default?"
-    log "  1) tmux    (installed: $has_tmux)"
-    log "  2) screen  (installed: $has_screen)"
-    printf "Choose 1/2 [default: %s]: " "$def" > /dev/tty
-    read ans < /dev/tty || ans=""
-    case "$ans" in
-      1|tmux|t|T)   BACKEND=tmux ;;
-      2|screen|s|S) BACKEND=screen ;;
-      "")           BACKEND="$def" ;;
-      *)            log "unrecognized '$ans' — using $def"; BACKEND="$def" ;;
-    esac
-  else
-    BACKEND="$def"
-    log "Non-interactive install; defaulting to $BACKEND (use --tmux/--screen or TEAM_BACKEND to change)."
-  fi
-fi
-case "$BACKEND" in tmux|screen) ;; *) log "invalid backend: $BACKEND"; exit 1 ;; esac
-
-# warn (don't fail) if the chosen backend isn't installed yet
-eval "chosen_installed=\$has_$BACKEND"
-[ "$chosen_installed" = no ] && \
-  log "WARNING: '$BACKEND' is not installed — install it before running start-team."
-have claude || log "WARNING: the 'claude' CLI was not found on PATH."
-
-# ---- fetch the tool -------------------------------------------------------
-log ""
-log "Installing claude-team to $INSTALL_DIR (backend: $BACKEND)"
-mkdir -p "$BIN_DIR" "$CONFIG_DIR"
-
-# safety: refuse to clobber a non-empty dir that isn't ours
-if [ -d "$INSTALL_DIR" ] && [ -n "$(ls -A "$INSTALL_DIR" 2>/dev/null)" ] \
-   && [ ! -d "$INSTALL_DIR/.git" ] && [ ! -f "$INSTALL_DIR/team/start-team.sh" ]; then
-  log "ERROR: $INSTALL_DIR exists and is not a claude-team install. Set CLAUDE_TEAM_HOME to a free path."
-  exit 1
-fi
-
-fetched=no
-if have git; then
-  if [ -d "$INSTALL_DIR/.git" ]; then
-    log "Updating existing clone ..."
-    git -C "$INSTALL_DIR" pull --ff-only >/dev/null 2>&1 && fetched=yes || fetched=no
-  else
-    tmp="$(mktemp -d)"
-    if git clone --depth 1 --branch "$BRANCH" "$CLONE_URL" "$tmp/repo" >/dev/null 2>&1; then
-      rm -rf "$INSTALL_DIR"; mkdir -p "$(dirname "$INSTALL_DIR")"; mv "$tmp/repo" "$INSTALL_DIR"
-      fetched=yes
+find_python() {
+  for py in python3.14 python3.13 python3.12 python3.11 python3; do
+    if have "$py" && "$py" -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; then
+      echo "$py"; return 0
     fi
-    rm -rf "$tmp"
-  fi
+  done
+  return 1
+}
+
+log "Installing collaborators ($REF)…"
+
+if have uv; then
+  uv tool install --force --python ">=3.11" "$SRC"
+elif have pipx; then
+  pipx install --force "$SRC"
+else
+  PY="$(find_python)" || die "Python 3.11+ is required (or install uv: https://docs.astral.sh/uv/)."
+  "$PY" -m venv "$HOME_DIR/venv" 2>/dev/null || die "could not create a virtualenv with $PY.
+On Debian/Ubuntu: sudo apt install python3-venv   — or install uv / pipx and re-run."
+  "$HOME_DIR/venv/bin/python" -m pip install --quiet --upgrade pip
+  "$HOME_DIR/venv/bin/python" -m pip install --quiet --upgrade "$SRC"
+  mkdir -p "$BIN_DIR"
+  ln -sf "$HOME_DIR/venv/bin/collab" "$BIN_DIR/collab"
+  case ":$PATH:" in
+    *":$BIN_DIR:"*) ;;
+    *) log "Add $BIN_DIR to your PATH:  export PATH=\"$BIN_DIR:\$PATH\"" ;;
+  esac
 fi
 
-if [ "$fetched" = no ]; then
-  log "Fetching tarball ..."
-  have curl || { log "ERROR: need git or curl to install."; exit 1; }
-  have tar  || { log "ERROR: need tar for the tarball fallback."; exit 1; }
-  tmp="$(mktemp -d)"
-  curl -fsSL "$TARBALL" | tar -xz -C "$tmp"
-  src="$tmp/collaborators-$BRANCH"
-  [ -d "$src" ] || src="$(find "$tmp" -maxdepth 1 -type d -name 'collaborators-*' | head -n1)"
-  [ -d "$src" ] || { log "ERROR: could not find extracted files."; exit 1; }
-  rm -rf "$INSTALL_DIR"; mkdir -p "$(dirname "$INSTALL_DIR")"; mv "$src" "$INSTALL_DIR"
-  rm -rf "$tmp"
-  fetched=yes
-fi
+have claude || log "note: the 'claude' CLI was not found on PATH. Log in to Claude Code once
+      (https://claude.com/claude-code) so the agents can authenticate."
 
-chmod +x "$INSTALL_DIR/team/start-team.sh" "$INSTALL_DIR/team/team.sh" 2>/dev/null || true
-
-# ---- save config ----------------------------------------------------------
-{
-  echo "# claude-team config (edit TEAM_BACKEND to switch, or re-run the installer)"
-  echo "TEAM_BACKEND=$BACKEND"
-  echo "TEAM_HOME=$INSTALL_DIR"
-} > "$CONFIG_FILE"
-log "Saved default backend '$BACKEND' -> $CONFIG_FILE"
-
-# ---- install the start-team launcher --------------------------------------
-LAUNCHER="$BIN_DIR/start-team"
-cat > "$LAUNCHER" <<EOF
-#!/usr/bin/env bash
-# start-team — launcher generated by the claude-team installer.
-# Reads your saved backend and starts the team with the right terminal.
-# Extra args are passed through (e.g. \`start-team --dir=/path\`, or
-# \`start-team --screen\` to override the default just this once).
-set -euo pipefail
-CONFIG_FILE="$CONFIG_FILE"
-TEAM_HOME="$INSTALL_DIR"
-TEAM_BACKEND=tmux
-[ -f "\$CONFIG_FILE" ] && . "\$CONFIG_FILE"
-exec "\$TEAM_HOME/team/start-team.sh" --terminal="\$TEAM_BACKEND" "\$@"
-EOF
-chmod +x "$LAUNCHER"
-log "Installed launcher -> $LAUNCHER"
-
-# ---- PATH advice + done ---------------------------------------------------
 log ""
-log "Done."
-case ":$PATH:" in
-  *":$BIN_DIR:"*) : ;;
-  *)
-    log "Add $BIN_DIR to your PATH, e.g.:"
-    log "  echo 'export PATH=\"$BIN_DIR:\$PATH\"' >> ~/.zshrc && source ~/.zshrc"
-    ;;
-esac
-log ""
-log "Usage:  cd /your/project && start-team"
-log "        start-team --screen     # override backend once"
-log "        start-team --dir=/path  # explicit working directory"
-log "Change the default backend anytime: edit $CONFIG_FILE (TEAM_BACKEND=tmux|screen)."
+log "Done. Try it without spending anything:   collab --demo"
+log "Then, in your project:                     cd /your/project && collab"
