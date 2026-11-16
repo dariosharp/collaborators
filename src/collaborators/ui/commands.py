@@ -48,6 +48,13 @@ class CommandMenu(OptionList):
     def hide(self) -> None:
         self.display = False
 
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        # Only a mouse click gets here: while typing, the keys go to the input.
+        event.stop()
+        for inp in self.parent.query(CommandInput) if self.parent else []:
+            if inp.menu_id == self.id:
+                inp.pick(event.option_index)
+
     @property
     def current(self) -> Command | None:
         if not self.display or self.highlighted is None or not self.commands:
@@ -57,17 +64,19 @@ class CommandMenu(OptionList):
 
 class CommandInput(Input):
     """Typing `/` lists the agent's slash commands and skills. Up/Down choose,
-    Tab or Enter completes, Esc closes the list; Enter again sends."""
+    Tab or Enter (or a click) completes, Esc closes the list; Enter again sends."""
 
     def __init__(self, commands: Callable[[], list[Command]], *, menu_id: str,
                  **kwargs) -> None:
         super().__init__(**kwargs)
         self._commands = commands
-        self._menu_id = menu_id
+        self.menu_id = menu_id
 
     @property
     def menu(self) -> CommandMenu:
-        return self.screen.query_one(f"#{self._menu_id}", CommandMenu)
+        # The menu is a sibling: several tabs may each have one with the same id.
+        assert self.parent is not None
+        return self.parent.query_one(f"#{self.menu_id}", CommandMenu)
 
     @property
     def menu_open(self) -> bool:
@@ -95,6 +104,13 @@ class CommandInput(Input):
         self.cursor_position = len(self.value)
         self.menu.hide()
         return True
+
+    def pick(self, index: int) -> None:
+        """Complete with the command at `index` in the list (clicked with the mouse)."""
+        if self.menu_open and 0 <= index < len(self.menu.commands):
+            self.menu.highlighted = index
+            self._complete()
+        self.focus()
 
     async def _on_key(self, event: events.Key) -> None:
         if self.menu_open:

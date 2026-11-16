@@ -2,6 +2,9 @@
 
 - team.json   — which conversation (session id) each agent owns, for --resume
 - tasks.jsonl — one line per finished task (the task board history)
+- tabs.json   — which teams (tabs) were open, for --resume
+
+The default team lives in .collab/ itself; other teams in .collab/teams/<name>/.
 
 Keeping it inside the project (not in the install dir) means two teams in two
 projects never step on each other, even when the directories share a name.
@@ -75,6 +78,27 @@ class StateStore:
             if isinstance(tid, str) and tid[1:].isdigit():
                 best = max(best, int(tid[1:]))
         return best
+
+
+def load_open_teams(project_dir: Path) -> list[str]:
+    """The teams (tabs) that were open when collab last quit, in tab order."""
+    try:
+        data = json.loads((project_dir / "tabs.json").read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+    teams = data.get("teams") if isinstance(data, dict) else None
+    return [t for t in teams if isinstance(t, str)] if isinstance(teams, list) else []
+
+
+def save_open_teams(project_dir: Path, teams: list[str]) -> None:
+    StateStore(project_dir).ensure()
+    tmp = project_dir / "tabs.tmp"
+    tmp.write_text(json.dumps({"version": STATE_VERSION, "teams": teams}) + "\n")
+    os.replace(tmp, project_dir / "tabs.json")
+
+
+def has_saved_team(state_dir: Path) -> bool:
+    return bool(StateStore(state_dir).load_sessions())
 
 
 def new_session_id() -> str:

@@ -7,7 +7,24 @@ from .config import TeamConfig
 TOOL_PREFIX = "mcp__team__"
 
 
-def lead_prompt(cfg: TeamConfig, names: list[str]) -> str:
+WORKTREES_LEAD = """
+## Worktrees: each worker has its own copy of the repository
+Every worker works in its own git worktree, so workers never step on each
+other's files and you can run them in parallel freely. Their changes reach the
+main directory (where the user, the testers and you work) only when you merge:
+1. dispatch_task to a worker; wait for its report (the files it changed are in
+   its worktree, not in the main directory yet).
+2. Verify it in place: dispatch_task to a tester with worktree_of="<worker>".
+3. On PASS call merge_work("<worker>"). If it reports a CONFLICT, dispatch the
+   same worker to resolve the conflict markers, then merge_work again.
+   On FAIL send the fix back to the same worker (it keeps its work), or call
+   discard_work("<worker>") to drop it.
+A worker's next task starts from the main directory as it is then, unless it
+still has work you have not merged or discarded.
+"""
+
+
+def lead_prompt(cfg: TeamConfig, names: list[str], isolated: bool = False) -> str:
     workers = ", ".join(n for n in names if n.startswith("worker"))
     testers = ", ".join(n for n in names if n.startswith("tester")) or "none"
     return f"""\
@@ -17,7 +34,7 @@ You work in {cfg.workdir}. The user talks only to you and watches every agent
 live in a terminal UI. Your team:
 - Workers (implement changes): {workers}
 - Testers (verify changes, never fix them): {testers}
-All agents share the same working directory and each keeps its own conversation
+All agents work on the same project and each keeps its own conversation
 across tasks, so a follow-up to the same agent can rely on what it already did.
 The user can add workers and testers while you work: you will be told with a
 "[team] … joined the team" note (in a tool result or a message). Use new agents
@@ -36,6 +53,7 @@ files and run read-only commands to understand the code and write precise tasks.
   the files it actually modified, cost, and any warnings.
 - `team_status()` — who is idle or busy, and with which task.
 - `cancel_task(task_id)` — interrupt a running task.
+- `message_lead(team, message)` — write to the Lead of another team (see below).
 
 ## How to work
 1. Plan the concrete change. Ask the user only if the request is genuinely ambiguous.
@@ -56,20 +74,41 @@ the same files, run them one after another.
 If a task finishes while you are not waiting for it, you will receive a
 "[team]" message with its report — handle it like a wait_tasks result.
 
+## Other teams
+You lead team "{cfg.team}". The user may open more teams in the same directory,
+each with its own Lead and agents (say one on the frontend, one on the backend);
+team_status lists them and what they are running. Do not dispatch work on files
+another team is working on (dispatch_task refuses it). When another team needs
+to know or decide something — an API or contract change, a shared file, a
+question only it can answer — tell its Lead with message_lead(team, message).
+Messages are one-way and self-contained; replies arrive as "[from the Lead of
+team …]" messages. Do not send greetings, thanks or acknowledgements.
+
+The user can talk to you while the agents work. If they write while you are in
+wait_tasks, the wait ends early and the result carries their message under
+"[user]" (or another Lead's, under "[from the Lead of team …]"): answer it
+(about anything), then go back to waiting or end your turn.
+
+{WORKTREES_LEAD if isolated else ""}
 Report honestly: if verification failed or something was skipped, say so.
 Keep your messages to the user short; they can see the agents' work directly.
 """
 
 
-def worker_prompt(name: str) -> str:
+def worker_prompt(name: str, isolated: bool = False) -> str:
+    where = (
+        "You work in your own git worktree (your current directory), a private copy\n"
+        "of the repository: the Lead merges your changes into the main directory once\n"
+        "they are verified. Do not commit, switch branches or touch other worktrees.\n"
+        if isolated else
+        "Other workers may be editing other files in the same directory at the same\n"
+        "time: only modify the files your task requires.\n")
     return f"""\
 # You are {name}, a WORKER in a team of Claude agents
 
 A Lead agent sends you tasks; the user watches your work live. Do the task
 completely and carefully, following the repository's existing conventions.
-Other workers may be editing other files in the same directory at the same
-time: only modify the files your task requires.
-
+{where}
 When you are done, end with a short report:
 - what you changed (files, and the gist of each change)
 - how to verify it (commands to run, behaviour to check)
@@ -94,10 +133,11 @@ description of each problem with file and line where possible.
 """
 
 
-def prompt_for(cfg: TeamConfig, agent: str, names: list[str] | None = None) -> str:
+def prompt_for(cfg: TeamConfig, agent: str, names: list[str] | None = None,
+               isolated: bool = False) -> str:
     role = cfg.role_of(agent)
     if role == "lead":
-        return lead_prompt(cfg, names or cfg.agent_names)
+        return lead_prompt(cfg, names or cfg.agent_names, isolated)
     if role == "tester":
         return tester_prompt(agent)
-    return worker_prompt(agent)
+    return worker_prompt(agent, isolated)

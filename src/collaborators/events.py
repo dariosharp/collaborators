@@ -142,6 +142,15 @@ class TaskRecord:
     cost_usd: float = 0.0
     num_turns: int = 0
     warnings: list[str] = field(default_factory=list)
+    # change tracking (git): the working tree it ran in, snapshots around it, and
+    # the files that differ between them
+    where: str = ""
+    snap_before: str = ""
+    snap_after: str = ""
+    changed_files: list[str] = field(default_factory=list)
+    overlapped: bool = False  # other tasks changed the same tree at the same time
+    undone: bool = False
+    merged: bool = False  # a worker task whose worktree changes reached the main directory
 
     @property
     def elapsed(self) -> float:
@@ -167,7 +176,10 @@ class TaskRecord:
             "finished_at": self.finished_at, "planned_files": self.planned_files,
             "touched_files": self.touched_files, "result": self.result,
             "cost_usd": self.cost_usd, "num_turns": self.num_turns,
-            "warnings": self.warnings,
+            "warnings": self.warnings, "where": self.where,
+            "snap_before": self.snap_before, "snap_after": self.snap_after,
+            "changed_files": self.changed_files, "overlapped": self.overlapped,
+            "undone": self.undone, "merged": self.merged,
         }
 
 

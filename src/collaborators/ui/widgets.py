@@ -14,6 +14,7 @@ from textual.app import ComposeResult
 from textual.containers import Vertical, VerticalScroll
 from textual.message import Message
 from textual.reactive import reactive
+from textual.timer import Timer
 from textual.widgets import Input, Static
 
 from ..agents import Command
@@ -33,9 +34,10 @@ from ..events import (
 )
 from ..orchestrator import fmt_duration
 from .commands import CommandInput, CommandMenu
-from .render import describe_call, describe_result, detail
+from .render import TEAM, describe_call, describe_result, detail
 
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+HOURGLASS = "⧗⧓⧖⧓"  # full, on its side, flipped over, on its side: an hourglass turning
 
 
 def short_model(model: str) -> str:
@@ -81,12 +83,27 @@ class ToolEntry(Entry):
         self.expanded = expanded
         self.result: ToolResult | None = None
         self.started = time.monotonic()
+        self._frame = 0
+        self._timer: Timer | None = None
+
+    @property
+    def is_wait(self) -> bool:
+        return self.call.name == TEAM + "wait_tasks"
 
     def on_mount(self) -> None:
+        if self.is_wait and self.result is None:
+            self._timer = self.set_interval(0.3, self._tick)
+        self._refresh_view()
+
+    def _tick(self) -> None:
+        self._frame = (self._frame + 1) % len(HOURGLASS)
         self._refresh_view()
 
     def set_result(self, result: ToolResult) -> None:
         self.result = result
+        if self._timer is not None:
+            self._timer.stop()
+            self._timer = None
         if result.is_error:
             self.add_class("error")
         self._refresh_view()
@@ -94,12 +111,14 @@ class ToolEntry(Entry):
     def _refresh_view(self) -> None:
         line = describe_call(self.call.name, self.call.input, self.workdir)
         head = Text()
-        head.append(f"{line.icon} ", style="bold")
+        icon = HOURGLASS[self._frame] if self._timer is not None else line.icon
+        head.append(f"{icon} ", style="bold")
         if line.verb:
             head.append(line.verb + " ", style="bold")
         head.append(line.target)
         if self.result is None:
-            head.append("  …", style="dim")
+            waited = int(time.monotonic() - self.started)
+            head.append(f"  {waited}s" if self.is_wait and waited else "  …", style="dim")
         else:
             summary = describe_result(self.call.name, self.call.input,
                                       self.result.content, self.result.is_error)

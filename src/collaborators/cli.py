@@ -33,6 +33,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help=f"model for the {role}")
         p.add_argument(f"--{role}-effort", choices=EFFORTS, default=None,
                        help=f"reasoning effort for the {role}")
+    p.add_argument("--worktrees", action="store_true", default=None,
+                   help="give each worker its own git worktree; the Lead merges verified work")
+    p.add_argument("--no-notify", dest="notify", action="store_false", default=None,
+                   help="no desktop notification when the Lead finishes a long turn")
     p.add_argument("--remote-control", action="store_true",
                    help="make the Lead controllable from claude.ai/code and the Claude app")
     p.add_argument("--demo", action="store_true",
@@ -54,6 +58,7 @@ def main(argv: list[str] | None = None) -> int:
     overrides = {
         "workers": args.workers, "testers": args.testers,
         "permission_mode": args.permission_mode, "ask": args.ask,
+        "worktrees": args.worktrees, "notify": args.notify,
         **{role: {"model": getattr(args, f"{role}_model"),
                   "effort": getattr(args, f"{role}_effort")}
            for role in ("lead", "worker", "tester")},

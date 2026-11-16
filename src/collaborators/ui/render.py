@@ -75,6 +75,13 @@ def describe_call(name: str, args: dict[str, Any], workdir: Path | None = None) 
         ids = ", ".join(args.get("task_ids") or []) or "all running"
         mode = " (first to finish)" if args.get("mode") == "any" else ""
         return ToolLine("⧗", "Wait", ids + mode)
+    if name == TEAM + "merge_work":
+        return ToolLine("⇲", "Merge", f"{args.get('agent', '?')} → main directory")
+    if name == TEAM + "discard_work":
+        return ToolLine("✕", "Discard", f"{args.get('agent', '?')}'s unmerged changes")
+    if name == TEAM + "message_lead":
+        return ToolLine("✉", f"To {args.get('team', '?')}",
+                        first_line(str(args.get("message", "")), 80))
     if name == TEAM + "team_status":
         return ToolLine("☰", "Team status", "")
     if name == TEAM + "cancel_task":
@@ -115,6 +122,8 @@ def describe_result(name: str, args: dict[str, Any], content: str, is_error: boo
     if name == TEAM + "dispatch_task":
         return first_line(content)
     if name == TEAM + "wait_tasks":
+        if "\nWhile you were waiting" in content:
+            return "paused for a message; the tasks keep running"
         heads = [ln for ln in content.splitlines() if ln.startswith("T") and " · " in ln]
         return "; ".join(h.split(" · ")[0] + " " + h.split(" · ")[2] for h in heads) or \
             first_line(content)

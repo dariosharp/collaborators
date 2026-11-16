@@ -59,9 +59,11 @@ Then describe what you want, e.g.
 | `/remote-control` | **continue with the Lead from claude.ai/code or the Claude app**; `/remote-control off` stops it (or start with `collab --remote-control`) |
 | `F2` / `F3` | **add a worker / a tester** — the Lead is told immediately and can use it at once |
 | `Delete` | **remove the focused worker or tester** (after a confirmation; a running task is cancelled) |
+| `Ctrl+N` | **open another team in a new tab** (its own Lead, workers and testers), e.g. one for the frontend and one for the backend |
+| `Ctrl+G` | next team's tab (or click it); close a tab from `Ctrl+P` |
 | `Tab` | move between the Lead and the agent cards |
 | `Ctrl+O` | full transcript of the focused agent: diffs, command output, and a direct line to it |
-| `Ctrl+T` | task board: every task, status, verdict, cost, files touched and report |
+| `Ctrl+T` | task board: every task, status, verdict, cost, files changed and report — **`d` shows a task's diff, `u` undoes it** |
 | `Ctrl+X` | interrupt the focused agent |
 | `Ctrl+P` | command palette (add or remove agents, task board, themes — dark and light) |
 | `F1` | help |
@@ -79,6 +81,8 @@ through real tools rather than by typing into terminals:
 | `wait_tasks(ids, mode="all"\|"any")` | wait for tasks and get each report, files modified, cost, warnings |
 | `team_status()` | who is idle or busy, with which task |
 | `cancel_task(id)` | interrupt a task |
+| `message_lead(team, message)` | write to the Lead of another team (tab) in the same directory |
+| `merge_work(agent)` / `discard_work(agent)` | with `--worktrees`: bring a worker's verified work into the main directory, or drop it |
 
 - **Completion is exact.** A task is done when its session returns its result. No
   screen scraping.
@@ -88,6 +92,30 @@ through real tools rather than by typing into terminals:
 - **Parallel work is guarded.** Workers share the directory, so the Lead declares the
   files a task will touch. A task that would overlap a running one is refused, and if
   two tasks do write the same file anyway, both reports carry a warning.
+- **You can talk while it waits.** A message sent while the Lead is in `wait_tasks`
+  ends the wait: the Lead answers, the agents keep working, and each report reaches
+  the Lead by itself when it is ready.
+- **Several teams, one directory.** Each tab is a team with its own Lead. The file
+  checks span every team, so one team cannot start work on files another is
+  changing. Leads can write to each other with `message_lead`: one-way messages,
+  shown in both tabs, a few at a time until you speak to that Lead again.
+- **Every task can be undone.** In a git repository, collab takes a snapshot of the
+  files before and after each task (with a private index: your branch, index and
+  history are never touched). The task board shows exactly what a task changed and
+  puts the files back on `u`; if they changed again since, it asks first. The Lead
+  is told.
+- **Workers can have their own worktree** (`--worktrees`, or `worktrees = true`).
+  Each worker gets a git worktree under `.collab/worktrees/`, so parallel workers
+  never collide. Testers verify a worker's change in its worktree, then the Lead
+  calls `merge_work`: the change lands in your directory as ordinary uncommitted
+  edits (a three-way merge if the directory moved on; conflicts go back to the
+  worker). A merge can be undone from the task board like any task.
+- **It tells you when it's done.** When the Lead finishes something that took a
+  while (30 s or more) or an agent needs your approval, collab rings the bell and
+  posts a desktop notification (iTerm2, WezTerm, kitty, Windows Terminal). Inside
+  tmux add `set -g allow-passthrough on` to `~/.tmux.conf`; without it the bell
+  still gets through (iTerm2: *Profiles → Terminal → Notifications*). Turn it off
+  with `--no-notify` or `notify = false`.
 - **Skills work everywhere.** Every agent loads your user and project settings and
   skills: they use skills on their own, and you can run any `/command` yourself.
 - **The Lead cannot edit code.** It is denied the editing tools: it plans, delegates
@@ -96,7 +124,9 @@ through real tools rather than by typing into terminals:
   `FAIL`, which shows on its card and on the task board.
 - **State lives in the project.** Session ids and task history are kept in
   `.collab/`, which ignores itself in git, so `--resume` brings everyone back,
-  including agents you added at runtime (and not the ones you removed).
+  including agents you added at runtime (and not the ones you removed), and every
+  tab that was open. Extra teams live in `.collab/teams/<name>/`; open a team with
+  a saved name to pick it up again.
 
 ## Configuration
 
@@ -116,6 +146,8 @@ workers = 2
 testers = 1
 permission_mode = "bypassPermissions"   # or acceptEdits, default, auto
 ask = false                              # true: approve tool use from the UI
+worktrees = false                        # true: each worker in its own git worktree
+notify = true                            # desktop notification when a long turn ends
 
 [worker]
 model = "claude-opus-5-5"
@@ -126,6 +158,7 @@ effort = "high"
 collab --workers 3 --testers 2 --tester-effort high --dir ~/code/shop
 collab --ask          # agents ask before running tools; approve with y / a / n
 collab --resume       # reopen every agent's previous conversation here
+collab --worktrees    # each worker in its own git worktree; the Lead merges
 collab --remote-control   # reach the Lead from claude.ai/code or your phone too
 ```
 

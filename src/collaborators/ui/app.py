@@ -1,50 +1,44 @@
-"""The Textual application: wires the Team's events into the widgets."""
+"""The Textual application: one tab per team, all in the same directory."""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import re
+import os
 import time
-from collections import defaultdict
 from collections.abc import Iterable
+from dataclasses import replace
 from typing import Any
 
+from textual import events
 from textual.app import App, ComposeResult, SystemCommand
 from textual.binding import Binding
-from textual.containers import Horizontal, VerticalScroll
 from textual.screen import Screen
-from textual.widgets import Footer, Input
+from textual.widgets import Footer, Input, TabbedContent, TabPane
 
-from ..agents import Backend, Command, Decision
-from ..config import TeamConfig
-from ..events import (
-    AgentAdded,
-    AgentRemoved,
-    AgentStatus,
-    Event,
-    Notice,
-    StatusChanged,
-    TaskRecord,
-    TaskUpdate,
-    TextDone,
-    TurnResult,
-)
-from ..orchestrator import LEAD, Team
-from .screens import (
-    AgentDetailScreen,
-    ApprovalScreen,
-    ConfirmScreen,
-    HelpScreen,
-    TaskBoardScreen,
-)
+from ..agents import Backend, Command
+from ..config import DEFAULT_TEAM, ConfigError, TeamConfig, check_team_name
+from ..events import Event, TaskRecord
+from ..orchestrator import Hub, Team
+from ..state import has_saved_team, load_open_teams, save_open_teams
+from .screens import ConfirmScreen, HelpScreen, NameScreen, TaskBoardScreen
+from .team_view import REMOTE_CMD, TeamView
 from .theme import THEMES
-from .widgets import AgentCard, LeadPanel, StatsBar, TopBar
+from .widgets import TopBar
 
-HISTORY_LIMIT = 3000
-REMOTE_CMD = Command("remote-control", "Control the Lead from claude.ai/code or the Claude "
-                     "app (collab)", "[off]")
-MODEL_SET = re.compile(r"Set model to `([^`]+)`")
+__all__ = ["CollabApp", "REMOTE_CMD"]
+
+MAX_TEAMS = 6
+SUGGESTED_NAMES = ("frontend", "backend", "docs", "infra", "api", "web")
+
+
+class TeamPane(TabPane):
+    """A tab. Unlike a plain TabPane, focus moving into it never switches tabs (as
+    when a dialog closes and gives the focus back): only the user switches tabs, and
+    switching moves the focus — the other way round, the two would chase each other."""
+
+    def _on_descendant_focus(self, event: events.DescendantFocus) -> None:
+        pass
 
 
 class CollabApp(App[None]):
@@ -53,6 +47,8 @@ class CollabApp(App[None]):
     BINDINGS = [
         Binding("f2", "add_agent('worker')", "+Worker"),
         Binding("f3", "add_agent('tester')", "+Tester"),
+        Binding("ctrl+n", "new_team", "New team"),
+        Binding("ctrl+g", "next_team", "Next team", show=False),
         Binding("ctrl+t", "tasks", "Tasks"),
         Binding("ctrl+o", "open_focused", "Transcript"),
         Binding("ctrl+x", "interrupt", "Interrupt"),
@@ -70,328 +66,292 @@ class CollabApp(App[None]):
         self.resume = resume
         self.initial_prompt = initial_prompt
         self.mode_label = mode_label
-        self.history: dict[str, list[Event]] = defaultdict(list)
-        self.tasks: dict[str, TaskRecord] = {}
-        self.team: Team | None = None
-        self._restart_note = ""
-        self._team_stopping = False
-        self._last_ctrl_c = 0.0
         self.remote_control_at_start = remote_control
+        self.hub = Hub()
+        self._views: list[TeamView] = []  # in tab order
+        self._quitting = False
+        self._last_ctrl_c = 0.0
+        self.sent_notifications: list[str] = []
 
     # ---- layout -----------------------------------------------------------------
-    def _summary(self, names: list[str]) -> str:
-        cfg = self.cfg
-        workers = sum(cfg.role_of(n) == "worker" for n in names)
-        testers = sum(cfg.role_of(n) == "tester" for n in names)
-        bits = [f"{workers} worker{'s' * (workers != 1)}",
-                f"{testers} tester{'s' * (testers != 1)}"]
-        perm = "asks before acting" if cfg.ask else {
-            "bypassPermissions": "full auto", "acceptEdits": "auto-edits",
-        }.get(cfg.permission_mode, cfg.permission_mode)
-        return " · ".join(bits + [perm] + ([self.mode_label] if self.mode_label else []))
-
     def compose(self) -> ComposeResult:
-        cfg = self.cfg
-        summary = self._summary(cfg.agent_names)
-        yield TopBar(cfg.workdir, summary)
-        lead = cfg.role_config(LEAD)
-        with Horizontal(id="main"):
-            yield LeadPanel(lead.model, lead.effort, cfg.workdir, self.initial_prompt,
-                            commands=lambda: self.commands_for(LEAD))
-            yield VerticalScroll(id="agents")
-        yield StatsBar()
+        yield TopBar(self.cfg.workdir, "")
+        yield TabbedContent(id="teams")
         yield Footer()
 
     async def on_mount(self) -> None:
         for theme in THEMES:
             self.register_theme(theme)
         self.theme = "collaborators"
-        self.team = Team(self.cfg, self.backend, self.on_team_event,
-                         resume=self.resume, approver=self.approve)
-        for name in self.team.agent_names[1:]:
-            self._mount_card(name)
-        self.query_one("#lead-input").focus()
-        self.run_worker(self._start_team(), name="team-start", exit_on_error=False)
+        names = (load_open_teams(self.cfg.project_dir) if self.resume else []) or [DEFAULT_TEAM]
+        for i, name in enumerate(names):
+            await self.open_team(name, resume=self.resume, first=i == 0)
+        await self._show(names[0])
 
-    async def _start_team(self) -> None:
-        assert self.team is not None
-        await self.team.start()
-        lead = self.query_one(LeadPanel)
-        if self.team.resumed:
-            names = ", ".join(self.team.resumed)
-            lead.feed(Notice(LEAD, f"Resumed the previous conversations of {names}."))
-            self._restart_note = (
-                "[team] The team app was restarted. Every agent kept its conversation, but "
-                "tasks that were running before the restart were interrupted; check with "
-                "team_status before relying on them.\n\n")
-        elif self.resume:
-            lead.feed(Notice(LEAD, "Nothing to resume here — started a fresh team.", "warning"))
-        if self.remote_control_at_start:
-            self.set_remote_control(True)
+    @property
+    def views(self) -> list[TeamView]:
+        return list(self._views)
 
-    # ---- events from the team ------------------------------------------------------
-    def on_team_event(self, event: Event) -> None:
-        if self._team_stopping:
-            return
-        hist = self.history[event.agent]
-        hist.append(event)
-        if len(hist) > HISTORY_LIMIT:
-            del hist[: len(hist) - HISTORY_LIMIT]
+    @property
+    def view(self) -> TeamView | None:
+        """The team in the active tab."""
+        try:
+            active = self.query_one(TabbedContent).active
+        except Exception:  # shutting down
+            return self._views[0] if self._views else None
+        return next((v for v in self._views if f"tab-{v.team_name}" == active), None)
 
-        if isinstance(event, AgentAdded):
-            self._mount_card(event.agent)
-            return
-        if isinstance(event, AgentRemoved):
-            self._unmount_card(event.agent)
-            return
-        if isinstance(event, TaskUpdate):
-            self.tasks[event.task.id] = event.task
-            self.query_one(StatsBar).set_task(event.task)
-            card = self._card(event.task.agent)
-            if card is not None:
-                card.set_task(event.task)
-            return
-        if isinstance(event, TurnResult):
-            self.query_one(StatsBar).add_result(event)
-        if isinstance(event, TextDone):
-            self._follow_model_switch(event)
+    def view_of(self, name: str) -> TeamView | None:
+        return next((v for v in self.views if v.team_name == name), None)
 
-        target: Any = self.query_one(LeadPanel) if event.agent == LEAD else \
-            self._card(event.agent)
-        if target is None:
-            return
-        if isinstance(event, StatusChanged):
-            target.status = event.status
-            if event.status is AgentStatus.ERROR and event.detail:
-                self.notify(event.detail, title=f"{event.agent} error", severity="error")
-        else:
-            target.feed(event)
-        screen = self.screen
-        if isinstance(screen, AgentDetailScreen) and not isinstance(event, StatusChanged):
-            screen.feed(event)
+    # For callers (and tests) that think in terms of "the" team: the active one.
+    @property
+    def team(self) -> Team | None:
+        view = self.view
+        return view.team if view else None
 
-    def _follow_model_switch(self, event: TextDone) -> None:
-        """`/model X` answers "Set model to `X` …": show the new model on the card."""
-        m = MODEL_SET.match(event.text)
-        if m is None or self.team is None or event.agent not in self.team.runners:
-            return
-        self.team.runners[event.agent].spec.model = m.group(1)
-        target: Any = self.query_one(LeadPanel) if event.agent == LEAD else \
-            self._card(event.agent)
-        if target is not None:
-            target.model = m.group(1)
-            target._render_header()
+    @property
+    def tasks(self) -> dict[str, TaskRecord]:
+        view = self.view
+        return view.tasks if view else {}
 
-    def _mount_card(self, name: str) -> None:
-        if self._card(name) is not None:
-            return
-        rc = self.cfg.role_config(name)
-        card = AgentCard(name, rc.model, rc.effort, self.cfg.workdir)
-        agents = self.query_one("#agents", VerticalScroll)
-        # Workers above testers, each group in number order.
-        def key(n: str) -> tuple[bool, int]:
-            return self.cfg.role_of(n) != "worker", int(n.lstrip("abcdefghijklmnopqrstuvwxyz"))
-        later = [c for c in agents.query(AgentCard) if key(c.agent) > key(name)]
-        if later:
-            agents.mount(card, before=later[0])
-        else:
-            agents.mount(card)
-        if self.team is not None:
-            self.query_one(TopBar).set_summary(self._summary(self.team.agent_names))
+    @property
+    def history(self) -> dict[str, list[Event]]:
+        view = self.view
+        return view.history if view else {}
 
-    def _unmount_card(self, name: str) -> None:
-        for screen in self.screen_stack:
-            if isinstance(screen, AgentDetailScreen) and screen.agent == name:
+    def commands_for(self, agent: str) -> list[Command]:
+        view = self.view
+        return view.commands_for(agent) if view else []
+
+    def open_detail(self, agent: str) -> None:
+        if self.view:
+            self.view.open_detail(agent)
+
+    # ---- tabs ---------------------------------------------------------------------
+    async def open_team(self, name: str, *, resume: bool, first: bool = False) -> TeamView:
+        cfg = replace(self.cfg, team=name)
+        view = TeamView(cfg, self.backend, self.hub, resume=resume,
+                        initial_prompt=self.initial_prompt if first else "",
+                        remote_control=self.remote_control_at_start and first)
+        tabs = self.query_one(TabbedContent)
+        self._views.append(view)
+        await tabs.add_pane(TeamPane(name, view, id=f"tab-{name}"))
+        self._save_tabs()
+        return view
+
+    async def _show(self, name: str) -> None:
+        tabs = self.query_one(TabbedContent)
+        tabs.active = f"tab-{name}"
+        view = self.view_of(name)
+        if view is not None:
+            self._refresh_chrome()
+            view.call_after_refresh(self._focus_if_active, view)
+
+    def _save_tabs(self) -> None:
+        with contextlib.suppress(OSError):
+            save_open_teams(self.cfg.project_dir, [v.team_name for v in self.views])
+
+    def _refresh_chrome(self) -> None:
+        try:
+            tabs = self.query_one(TabbedContent)
+        except Exception:  # shutting down
+            return
+        for view in self.views:
+            with contextlib.suppress(Exception):
+                tab = tabs.get_tab(f"tab-{view.team_name}")
+                if str(tab.label) != view.tab_label():  # a new label re-animates the bar
+                    tab.label = view.tab_label()
+        view = self.view
+        if view is not None:
+            summary = view.summary()
+            if self.mode_label:
+                summary += f" · {self.mode_label}"
+            self.query_one(TopBar).set_summary(summary)
+        # One tab needs no tab bar.
+        tabs.set_class(len(self.views) < 2, "-single")
+
+    def on_team_view_changed(self, message: TeamView.Changed) -> None:
+        if self._quitting:
+            return
+        if message.view is self.view:
+            self._refresh_chrome()
+            return
+        with contextlib.suppress(Exception):
+            tab = self.query_one(TabbedContent).get_tab(f"tab-{message.view.team_name}")
+            if str(tab.label) != message.view.tab_label():
+                tab.label = message.view.tab_label()
+
+    def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+        if self._quitting:
+            return
+        self._refresh_chrome()
+        view = next((v for v in self._views if f"tab-{v.team_name}" == event.pane.id), None)
+        if view is not None:
+            view.call_after_refresh(self._focus_if_active, view)
+
+    def _focus_if_active(self, view: TeamView) -> None:
+        if view is self.view:
+            view.focus_input()
+
+    def _check_new_name(self, name: str) -> str | None:
+        try:
+            name = check_team_name(name)
+        except ConfigError as exc:
+            return str(exc)
+        if self.view_of(name) is not None:
+            return f"team {name} is already open"
+        return None
+
+    def action_new_team(self) -> None:
+        if len(self.views) >= MAX_TEAMS:
+            self.notify(f"At most {MAX_TEAMS} teams at once.", severity="warning")
+            return
+        taken = {v.team_name for v in self.views}
+        suggestion = next((n for n in SUGGESTED_NAMES if n not in taken), "")
+
+        def answer(name: str | None) -> None:
+            if name:
+                self.run_worker(self._new_team(name), exit_on_error=False)
+            elif self.view is not None:
+                self.view.focus_input()
+
+        # Closing the dialog gives the focus back to what had it, and focusing a widget
+        # in another tab switches to that tab: so drop the focus first, or the new tab
+        # could lose to the old one.
+        self.screen.set_focus(None)
+        self.push_screen(NameScreen(
+            "New team", "A new tab with its own Lead, workers and testers, working in the same "
+            "directory. Use a saved name to pick that team up where it left off.",
+            suggestion, self._check_new_name), callback=answer)
+
+    async def _new_team(self, name: str) -> None:
+        resume = has_saved_team(replace(self.cfg, team=name).state_dir)
+        await self.open_team(name, resume=resume)
+        await self._show(name)
+        self.notify(f"Team {name} {'resumed' if resume else 'started'} in a new tab.",
+                    title="Teams")
+
+    def action_next_team(self) -> None:
+        views = self.views
+        if len(views) < 2 or self.view is None:
+            return
+        nxt = views[(views.index(self.view) + 1) % len(views)]
+        self.run_worker(self._show(nxt.team_name), exit_on_error=False)
+
+    def action_close_team(self, name: str) -> None:
+        view = self.view_of(name)
+        if view is None:
+            return
+        if len(self.views) < 2:
+            self.notify("This is the only team; quit with Ctrl+C instead.", severity="warning")
+            return
+        running = sum(not t.status.finished for t in view.tasks.values())
+        detail = (f"{running} running task{'s' * (running != 1)} will be stopped. "
+                  if running else "") + \
+            f"Its conversations are kept: open a team called {name} again to resume it."
+
+        def answer(yes: bool | None) -> None:
+            if yes:
+                self.run_worker(self._close_team(view), exit_on_error=False)
+
+        self.push_screen(ConfirmScreen(f"Close team {name}?", detail), callback=answer)
+
+    async def _close_team(self, view: TeamView) -> None:
+        for screen in list(self.screen_stack[1:]):
+            if getattr(screen, "view", None) is view:
                 while self.screen is not screen:
                     self.pop_screen()
                 self.pop_screen()
                 break
-        card = self._card(name)
-        if card is not None:
-            card.remove()
-        if self.team is not None:
-            self.query_one(TopBar).set_summary(self._summary(self.team.agent_names))
+        await view.stop()
+        self._views.remove(view)
+        await self.query_one(TabbedContent).remove_pane(f"tab-{view.team_name}")
+        self._save_tabs()
+        self._refresh_chrome()
+        if self.view is not None:
+            self.view.call_after_refresh(self.view.focus_input)
 
-    def _card(self, agent: str) -> AgentCard | None:
-        try:
-            return self.query_one(f"#card-{agent}", AgentCard)
-        except Exception:
-            return None
-
-    # ---- user actions -------------------------------------------------------------
-    def commands_for(self, agent: str) -> list[Command]:
-        runner = self.team.runners.get(agent) if self.team is not None else None
-        if runner is None:
-            return []
-        extra = [REMOTE_CMD] if agent == LEAD and self.team.remote_control_available else []
-        return extra + [c for c in runner.commands if c.name != REMOTE_CMD.name]
-
-    def set_remote_control(self, enabled: bool) -> None:
-        """Make the Lead reachable from claude.ai/code and the Claude apps (or stop)."""
-        if self.team is None:
-            return
-        lead = self.query_one(LeadPanel)
-
-        async def switch() -> None:
-            assert self.team is not None
-            try:
-                url = await self.team.set_remote_control(enabled)
-            except Exception as exc:
-                lead.feed(Notice(LEAD, f"Remote Control failed: {exc}", "error"))
-                self.notify(str(exc), title="Remote Control", severity="error")
-                return
-            lead.remote_url = url
-            lead._render_header()
-            if enabled:
-                lead.feed(Notice(LEAD, f"Remote Control on — continue from {url} or from "
-                                       "the Claude app. Turn it off with /remote-control off."))
-                self.notify(f"{url}", title="Remote Control on", timeout=10)
-            else:
-                lead.feed(Notice(LEAD, "Remote Control off."))
-
-        self.run_worker(switch(), exit_on_error=False)
-
-    def on_lead_panel_submitted(self, message: LeadPanel.Submitted) -> None:
-        if self.team is None:
-            return
-        self.query_one(LeadPanel).show_user(message.text)
-        if message.text.startswith("/"):
-            # A slash command goes to Claude Code exactly as typed.
-            parts = message.text[1:].split()
-            if parts and parts[0] == REMOTE_CMD.name and self.team.remote_control_available:
-                self.set_remote_control(not (len(parts) > 1 and parts[1] == "off"))
-            elif self.check_command(LEAD, message.text):
-                self.team.tell_lead(message.text)
-            return
-        self.team.tell_lead(self._restart_note + message.text)
-        self._restart_note = ""
-
-    def on_agent_card_open(self, message: AgentCard.Open) -> None:
-        self.open_detail(message.agent)
-
-    def open_detail(self, agent: str) -> None:
-        rc = self.cfg.role_config(agent)
-        self.push_screen(AgentDetailScreen(agent, rc.model, rc.effort, self.cfg.workdir,
-                                           list(self.history[agent])))
-
-    def check_command(self, agent: str, text: str) -> bool:
-        """Catch a /command the agent's session doesn't have, instead of sending it
-        into the void."""
-        rest = text[1:]
-        name = rest.split(maxsplit=1)[0] if rest and not rest[0].isspace() else ""
-        if not name:
-            self.notify("Write the command right after the slash, e.g. /model or "
-                        "/code-review.", severity="warning")
-            return False
-        known = {c.name for c in self.commands_for(agent)}
-        if known and name not in known:
-            self.notify(f"/{name} isn't available here. Agents run as headless Claude Code "
-                        "sessions, so commands that drive the interactive terminal (such as "
-                        "/remote-control) don't exist. Type / to see what does.",
-                        title="Unknown command", severity="warning", timeout=8)
-            return False
-        return True
-
-    def send_direct(self, agent: str, text: str) -> None:
-        if self.team is None:
-            return
-        if text.startswith("/") and not self.check_command(agent, text):
-            return
-        try:
-            self.team.dispatch(agent, text, origin="user")
-        except ValueError as exc:
-            self.notify(str(exc), severity="warning")
-
-    def interrupt_agent(self, agent: str) -> None:
-        if self.team is not None:
-            self.run_worker(self.team.interrupt(agent), exit_on_error=False)
-            self.notify(f"Interrupting {agent}…")
-
-    def _focused_agent(self) -> str:
-        node = self.focused
-        while node is not None:
-            if isinstance(node, AgentCard):
-                return node.agent
-            node = node.parent  # type: ignore[assignment]
-        return LEAD
-
-    def action_open_focused(self) -> None:
-        self.open_detail(self._focused_agent())
-
-    def action_interrupt(self) -> None:
-        self.interrupt_agent(self._focused_agent())
-
+    # ---- actions on the active team -------------------------------------------------
     def action_add_agent(self, role: str) -> None:
-        if self.team is None:
-            return
-
-        async def add() -> None:
-            assert self.team is not None
-            try:
-                name = await self.team.add_agent(role)
-            except ValueError as exc:
-                self.notify(str(exc), severity="warning")
-                return
-            self.notify(f"{name} joined the team — the Lead has been told.", title="Team")
-
-        self.run_worker(add(), exit_on_error=False)
-
-    def on_agent_card_remove(self, message: AgentCard.Remove) -> None:
-        self.action_remove_agent(message.agent)
+        if self.view:
+            self.view.add_agent(role)
 
     def action_remove_agent(self, name: str | None = None) -> None:
-        if self.team is None:
-            return
-        name = name or self._focused_agent()
-        if name == LEAD or name not in self.team.runners:
-            self.notify("Focus a worker or tester card (Tab) to remove it.", severity="warning")
-            return
-        task = next((t for t in self.tasks.values()
-                     if t.agent == name and not t.status.finished), None)
-        detail = (f"It is working on {task.id}, which will be cancelled." if task
-                  else "It is idle.") + " The Lead will be told."
+        if self.view:
+            self.view.remove_agent(name)
 
-        def answer(yes: bool | None) -> None:
-            if yes:
-                self.run_worker(remove(), exit_on_error=False)
+    def action_open_focused(self) -> None:
+        if self.view:
+            self.view.open_detail(self.view.focused_agent())
 
-        async def remove() -> None:
-            assert self.team is not None
-            try:
-                await self.team.remove_agent(name)
-            except ValueError as exc:
-                self.notify(str(exc), severity="warning")
-                return
-            self.notify(f"{name} left the team — the Lead has been told.", title="Team")
+    def action_interrupt(self) -> None:
+        if self.view:
+            self.view.interrupt_agent(self.view.focused_agent())
 
-        self.push_screen(ConfirmScreen(f"Remove {name} from the team?", detail), callback=answer)
-
-    def get_system_commands(self, screen: Screen[Any]) -> Iterable[SystemCommand]:
-        yield from super().get_system_commands(screen)
-        yield SystemCommand("Add a worker", "Start one more worker; the Lead is told at once",
-                            lambda: self.action_add_agent("worker"))
-        yield SystemCommand("Add a tester", "Start one more tester; the Lead is told at once",
-                            lambda: self.action_add_agent("tester"))
-        if self.team is not None:
-            for name in self.team.agent_names:
-                if name != LEAD:
-                    yield SystemCommand(f"Remove {name}", "Take it off the team; the Lead is told",
-                                        lambda n=name: self.action_remove_agent(n))
-        if self.team is not None and self.team.remote_control_available:
-            on = bool(self.query_one(LeadPanel).remote_url)
-            yield SystemCommand("Remote Control: " + ("turn off" if on else "turn on"),
-                                "Continue with the Lead from claude.ai/code or the Claude app",
-                                lambda: self.set_remote_control(not on))
-        yield SystemCommand("Task board", "Every task with status, cost and report",
-                            self.action_tasks)
+    def set_remote_control(self, enabled: bool) -> None:
+        if self.view:
+            self.view.set_remote_control(enabled)
 
     def action_tasks(self) -> None:
-        if not isinstance(self.screen, TaskBoardScreen):
-            self.push_screen(TaskBoardScreen(self.tasks))
+        if self.view and not isinstance(self.screen, TaskBoardScreen):
+            self.push_screen(TaskBoardScreen(self.view.tasks, self.view))
 
     def action_help(self) -> None:
         self.push_screen(HelpScreen())
 
+    def get_system_commands(self, screen: Screen[Any]) -> Iterable[SystemCommand]:
+        yield from super().get_system_commands(screen)
+        view = self.view
+        yield SystemCommand("New team", "Open another team (Lead, workers, testers) in a new "
+                            "tab, in the same directory", self.action_new_team)
+        for other in self.views:
+            if other is not view:
+                yield SystemCommand(f"Go to team {other.team_name}", "Switch tab",
+                                    lambda n=other.team_name: self.run_worker(self._show(n)))
+        if len(self.views) > 1:
+            for v in self.views:
+                yield SystemCommand(f"Close team {v.team_name}",
+                                    "Stop its agents and close the tab (it can be resumed)",
+                                    lambda n=v.team_name: self.action_close_team(n))
+        yield SystemCommand("Add a worker", "Start one more worker; the Lead is told at once",
+                            lambda: self.action_add_agent("worker"))
+        yield SystemCommand("Add a tester", "Start one more tester; the Lead is told at once",
+                            lambda: self.action_add_agent("tester"))
+        if view is not None and view.team is not None:
+            for name in view.team.agent_names[1:]:
+                yield SystemCommand(f"Remove {name}", "Take it off the team; the Lead is told",
+                                    lambda n=name: self.action_remove_agent(n))
+            if view.team.remote_control_available:
+                on = bool(view.remote_url)
+                yield SystemCommand("Remote Control: " + ("turn off" if on else "turn on"),
+                                    "Continue with the Lead from claude.ai/code or the Claude "
+                                    "app", lambda: self.set_remote_control(not on))
+        yield SystemCommand("Task board", "Every task with status, cost and report",
+                            self.action_tasks)
+
+    # ---- desktop notifications ----------------------------------------------------
+    def notify_desktop(self, title: str, body: str) -> None:
+        """Ring the bell and post a desktop notification (OSC 9: iTerm2, WezTerm, kitty,
+        Windows Terminal…). Inside tmux it needs `set -g allow-passthrough on`;
+        the bell gets through regardless, and iTerm2 can notify on it too."""
+        text = "".join(ch for ch in f"{title}: {body}" if ch.isprintable())[:180]
+        seq = f"\x1b]9;{text}\x07"
+        if os.environ.get("TMUX"):
+            seq = "\x1bPtmux;" + seq.replace("\x1b", "\x1b\x1b") + "\x1b\\"
+        self.sent_notifications.append(text)
+        driver = getattr(self, "_driver", None)
+        if driver is not None and not self.is_headless:
+            with contextlib.suppress(Exception):
+                driver.write(seq)
+                driver.flush()
+        self.bell()
+        view = self.view
+        if view is None or title != ("collab" if view.team_name == DEFAULT_TEAM
+                                     else f"collab · {view.team_name}"):
+            self.notify(body, title=title, timeout=8)  # from a tab you are not looking at
+
+    # ---- quitting -----------------------------------------------------------------
     async def action_ctrl_c(self) -> None:
         """Like Claude Code: Ctrl+C clears what you are typing; pressed twice, it quits."""
         focused = self.focused
@@ -406,37 +366,18 @@ class CollabApp(App[None]):
         self.notify("Press Ctrl+C again to quit.", timeout=2)
 
     async def action_quit(self) -> None:
-        if self.team is not None:
+        if any(v.team is not None for v in self.views):
             self.notify("Stopping agents…")
-        await self._stop_team()
+        await self._stop_teams()
         self.exit()
 
     async def on_unmount(self) -> None:
-        await self._stop_team()
+        await self._stop_teams()
 
-    async def _stop_team(self) -> None:
-        self._team_stopping = True
-        team, self.team = self.team, None
-        if team is not None:
-            with contextlib.suppress(Exception):  # quitting must never hang or crash
-                await asyncio.wait_for(team.shutdown(), timeout=10)
-
-    # ---- permission prompts (--ask) -------------------------------------------------
-    async def approve(self, agent: str, tool: str, args: dict[str, Any]) -> Decision:
-        target: Any = self.query_one(LeadPanel) if agent == LEAD else self._card(agent)
-        previous = target.status if target is not None else None
-        if target is not None:
-            target.status = AgentStatus.WAITING
-        future: asyncio.Future[Decision] = asyncio.get_running_loop().create_future()
-
-        def done(decision: Decision | None) -> None:
-            if not future.done():
-                future.set_result(decision or Decision(allow=False))
-
-        self.push_screen(ApprovalScreen(agent, tool, args), callback=done)
-        self.bell()
-        try:
-            return await future
-        finally:
-            if target is not None and previous is not None:
-                target.status = previous
+    async def _stop_teams(self) -> None:
+        if self._quitting:
+            return
+        self._quitting = True
+        views = self.views
+        with contextlib.suppress(Exception):  # quitting must never hang or crash
+            await asyncio.gather(*(v.stop() for v in views), return_exceptions=True)

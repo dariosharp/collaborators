@@ -18,6 +18,21 @@ Screen {
 }
 
 /* ---- layout --------------------------------------------------------------- */
+#teams {
+    height: 1fr;
+}
+#teams.-single ContentTabs {
+    display: none;
+}
+#teams ContentSwitcher, #teams TabPane {
+    height: 1fr;
+}
+#teams TabPane {
+    padding: 0;
+}
+TeamView {
+    height: 1fr;
+}
 #main {
     height: 1fr;
     padding: 0 1;

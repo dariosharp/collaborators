@@ -326,3 +326,241 @@ async def test_remove_busy_agent_cancels_its_task(tmp_path):
     # reported once, through the announcement, not again as a finished task
     assert "A task finished while you were not waiting" not in told
     await team.shutdown()
+
+
+async def test_user_message_ends_the_leads_wait(tmp_path):
+    gates = {"worker1": asyncio.Event()}
+    outputs: list[str] = []
+    workers = gated_brain(gates)
+
+    async def brain(s: FakeSession, prompt: str) -> AsyncIterator[Event]:
+        if s.spec.role != "lead":
+            async for e in workers(s, prompt):
+                yield e
+            return
+        if prompt == "go":  # dispatch, then wait, and end the turn when interrupted
+            async for e in s.call_team_tool("dispatch_task", {"agent": "worker1", "task": "x"}):
+                yield e
+            async for e in s.call_team_tool("wait_tasks", {"task_ids": ["T1"]}):
+                yield e
+            outputs.append(s.last_tool_output)
+        yield s.done("ok")
+
+    team, _, sessions = make_team(tmp_path, brain, workers=1)
+    await team.start()
+    team.tell_lead("go")
+    for _ in range(50):
+        await asyncio.sleep(0)
+    assert team.runners["lead"].busy and not outputs
+    team.tell_lead("/context", chat=False)  # commands still wait for the turn to end
+    team.tell_lead("how does the cache work?")
+    for _ in range(50):
+        await asyncio.sleep(0)
+    [out] = outputs
+    assert "T1 · worker1 · running" in out
+    assert "[user]" in out and "how does the cache work?" in out
+    assert team.tasks["T1"].status is TaskStatus.RUNNING
+    # the Lead ended its turn: the worker's report arrives on its own later
+    gates["worker1"].set()
+    for _ in range(3):
+        await settle(team)
+        for _ in range(50):
+            await asyncio.sleep(0)
+    prompts = sessions["lead"].prompts
+    assert prompts[:2] == ["go", "/context"]
+    assert "how does the cache work?" not in prompts  # delivered inside the wait
+    assert any(p.startswith("[team] A task finished") and "T1" in p for p in prompts)
+    await team.shutdown()
+
+
+def two_teams(tmp_path: Path, brain):
+    from dataclasses import replace
+
+    from collaborators.orchestrator import Hub
+
+    hub = Hub()
+    cfg = load_config(tmp_path, {"workers": 1, "testers": 0})
+    backend = fake_backend(brain, speed=0)
+    ev_a: list[Event] = []
+    ev_b: list[Event] = []
+    a = Team(cfg, backend, ev_a.append, hub=hub)
+    b = Team(replace(cfg, team="backend"), backend, ev_b.append, hub=hub)
+    return a, b, ev_a, ev_b, backend.sessions  # type: ignore[attr-defined]
+
+
+async def test_teams_in_one_directory_see_each_others_files(tmp_path):
+    gates = {"worker1": asyncio.Event()}
+    a, b, ev_a, ev_b, _ = two_teams(tmp_path, gated_brain(gates, {"worker1": ["api.py"]}))
+    await a.start()
+    await b.start()
+    assert b.store.dir == tmp_path / ".collab" / "teams" / "backend"
+    b.dispatch("worker1", "change the API", files=["api.py"])
+    with pytest.raises(ValueError, match="team backend's T1 \\(worker1\\).*message_lead"):
+        a.dispatch("worker1", "use the API", files=["api.py"])
+    a.dispatch("worker1", "something else")  # writes api.py too: both teams are warned
+    for _ in range(50):
+        await asyncio.sleep(0)
+    assert any(isinstance(e, Notice) and "team backend's T1" in e.text for e in ev_a)
+    assert any(isinstance(e, Notice) and "team main's T1" in e.text for e in ev_b)
+    assert "other teams in this directory" in a.status_report()
+    assert "backend (Lead idle, running T1 on worker1 (api.py))" in a.status_report()
+    gates["worker1"].set()
+    await a.shutdown()
+    await b.shutdown()
+    assert not a.hub.teams
+
+
+async def test_leads_message_each_other_within_a_budget(tmp_path):
+    from collaborators.orchestrator import PEER_MESSAGE_BUDGET
+
+    outputs: list[str] = []
+
+    async def brain(s: FakeSession, prompt: str) -> AsyncIterator[Event]:
+        if s.spec.team == "main" and prompt.startswith("tell"):
+            for _ in range(PEER_MESSAGE_BUDGET + 1):
+                async for e in s.call_team_tool("message_lead", {
+                        "team": "backend", "message": "GET /users now returns {items, next}"}):
+                    yield e
+                outputs.append(s.last_tool_output)
+            async for e in s.call_team_tool("message_lead", {"team": "nope", "message": "x"}):
+                yield e
+            outputs.append(s.last_tool_output)
+        yield s.done("ok")
+
+    a, b, ev_a, ev_b, sessions = two_teams(tmp_path, brain)
+    await a.start()
+    await b.start()
+    a.tell_lead("tell backend about the API")
+    for _ in range(3):
+        await settle(a)
+        await settle(b)
+    assert outputs[0].startswith("Delivered to the Lead of team backend")
+    assert "message limit reached" in outputs[PEER_MESSAGE_BUDGET]
+    assert "no other team called 'nope'; other teams: backend" in outputs[-1]
+    got = sessions["backend/lead"].prompts
+    assert len(got) == PEER_MESSAGE_BUDGET
+    assert got[0].startswith("[from the Lead of team main]") and "{items, next}" in got[0]
+    assert any(isinstance(e, Notice) and e.text.startswith("✉ from team main") for e in ev_b)
+    a.tell_lead("thanks")  # the user talking again refills the budget
+    assert a.peer_budget == PEER_MESSAGE_BUDGET
+    await a.shutdown()
+    await b.shutdown()
+
+
+# ---- change tracking, undo and worktrees (real git, fake agents) ---------------
+
+def git_repo(path: Path) -> None:
+    import subprocess
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    (path / "app.py").write_text("x = 1\ny = 2\nz = 3\n")
+    subprocess.run(["git", "-C", str(path), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(path), "-c", "user.name=t", "-c", "user.email=t@t",
+                    "commit", "-qm", "init"], check=True)
+
+
+def writing_brain(edits: dict[str, list[tuple[str, str, str]]]):
+    """Each prompt maps to (file, old, new) replacements done for real in the agent's cwd."""
+
+    async def brain(s: FakeSession, prompt: str) -> AsyncIterator[Event]:
+        if s.spec.role == "lead":
+            yield s.done("ok")
+            return
+        for name, old, new in edits.get(prompt, []):
+            f = s.spec.cwd / name
+            text = f.read_text() if f.exists() else ""
+            f.write_text(text.replace(old, new) if old else text + new)
+            async for e in s.use("Edit", {"file_path": str(f), "old_string": old,
+                                          "new_string": new}, "ok", 0):
+                yield e
+        yield s.done(f"did {prompt}", cost=0.1)
+
+    return brain
+
+
+async def test_task_changes_are_tracked_and_can_be_undone(tmp_path):
+    from collaborators.orchestrator import NeedsConfirmation
+
+    git_repo(tmp_path)
+    team, events, _ = make_team(tmp_path, writing_brain({
+        "A": [("app.py", "x = 1", "x = 10"), ("new.py", "", "print('hi')\n")],
+        "B": [("app.py", "z = 3", "z = 30")]}), workers=1, testers=0)
+    await team.start()
+    [a] = await team.wait([team.dispatch("worker1", "A").id], timeout=10)
+    assert a.changed_files == ["app.py", "new.py"] and a.snap_before and a.snap_after
+    assert "files modified: app.py, new.py" in team.task_report(a)
+    [b] = await team.wait([team.dispatch("worker1", "B").id], timeout=10)
+
+    # B touched app.py after A: undoing A asks first
+    with pytest.raises(NeedsConfirmation) as exc:
+        await team.undo(a.id)
+    assert exc.value.files == ["app.py"]
+    await team.undo(b.id)
+    assert (tmp_path / "app.py").read_text() == "x = 10\ny = 2\nz = 3\n"
+    await team.undo(a.id)  # now nothing changed since A: no confirmation needed
+    assert (tmp_path / "app.py").read_text() == "x = 1\ny = 2\nz = 3\n"
+    assert not (tmp_path / "new.py").exists()
+    assert a.undone and team.can_undo(a) == "it was already undone"
+    for _ in range(50):
+        await asyncio.sleep(0)
+    assert any(f"The user undid {a.id}" in p for p in team.runners["lead"].session.prompts)
+    await team.shutdown()
+
+
+async def test_workers_in_worktrees_and_merge(tmp_path):
+    from dataclasses import replace
+
+    git_repo(tmp_path)
+    brain = writing_brain({"A": [("app.py", "x = 1", "x = 10")],
+                           "B": [("app.py", "z = 3", "z = 30")],
+                           "C": [("app.py", "y = 2", "y = 'worker'")]})
+    cfg = replace(load_config(tmp_path, {"workers": 2, "testers": 0}), worktrees=True)
+    team = Team(cfg, fake_backend(brain, speed=0), lambda e: None)
+    assert team.ws.isolated
+    assert team.runners["worker1"].spec.cwd == tmp_path / ".collab/worktrees/main/worker1"
+    assert {"merge_work", "discard_work"} <= {t.name for t in team.runners["lead"].spec.tools}
+    await team.start()
+
+    # two workers change the same file in parallel: no clash, each in its own tree
+    ta = team.dispatch("worker1", "A", files=["app.py"])
+    tb = team.dispatch("worker2", "B", files=["app.py"])
+    await team.wait([ta.id, tb.id], timeout=10)
+    assert (tmp_path / "app.py").read_text() == "x = 1\ny = 2\nz = 3\n"  # not merged yet
+    assert ta.changed_files == ["app.py"] and ta.touched_files == ["app.py"]
+    assert "not in the main directory until you call merge_work('worker1')" in \
+        team.task_report(ta)
+
+    m1 = await team.merge_work("worker1")
+    assert (tmp_path / "app.py").read_text() == "x = 10\ny = 2\nz = 3\n"
+    assert ta.merged and "undo the merge" in team.can_undo(ta)
+    m2 = await team.merge_work("worker2")  # three-way: both changes survive
+    assert (tmp_path / "app.py").read_text() == "x = 10\ny = 2\nz = 30\n"
+    assert await team.merge_work("worker2") == "worker2 has no changes waiting to be merged."
+
+    # undoing a merge takes its changes back out of the main directory
+    await team.undo(m2.id)
+    assert (tmp_path / "app.py").read_text() == "x = 10\ny = 2\nz = 3\n"
+    assert m1.origin == "merge"
+
+    # a conflicting change is merged into the worktree, with markers, not into main
+    [tc] = await team.wait([team.dispatch("worker1", "C").id], timeout=10)
+    (tmp_path / "app.py").write_text("x = 10\ny = 'user'\nz = 3\n")  # main moves on
+    out = await team.merge_work("worker1")
+    assert isinstance(out, str) and out.startswith("CONFLICT") and "app.py" in out
+    wt = tmp_path / ".collab/worktrees/main/worker1/app.py"
+    assert "<<<<<<< main directory" in wt.read_text()
+    assert (tmp_path / "app.py").read_text() == "x = 10\ny = 'user'\nz = 3\n"
+    wt.write_text("x = 10\ny = 'both'\nz = 3\n")  # the worker resolves it
+    m3 = await team.merge_work("worker1")
+    assert not isinstance(m3, str)
+    assert (tmp_path / "app.py").read_text() == "x = 10\ny = 'both'\nz = 3\n"
+
+    # discard drops unmerged work
+    await team.wait([team.dispatch("worker2", "A").id], timeout=10)
+    assert await team.discard_work("worker2") == ["app.py"]
+    assert await team.ws.pending("worker2") == []
+    # the user's git is untouched: no commits, nothing staged
+    import subprocess
+    log = subprocess.run(["git", "-C", str(tmp_path), "log", "--oneline"], capture_output=True,
+                         text=True).stdout
+    assert log.count("\n") == 1
+    await team.shutdown()

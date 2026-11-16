@@ -143,6 +143,13 @@ async def demo_brain(s: FakeSession, prompt: str) -> AsyncIterator[Event]:
 
 
 async def _demo_lead(s: FakeSession, prompt: str) -> AsyncIterator[Event]:
+    if prompt.startswith("[from the Lead of team"):
+        sender = prompt.split("team ", 1)[1].split("]", 1)[0]
+        text = f"(demo) Noted the message from team {sender}; a real Lead would act on it."
+        async for e in s.say(text):
+            yield e
+        yield s.done(text, cost=0.01)
+        return
     if prompt.startswith("[team]"):
         async for e in s.say("Noted — that result is already folded into the summary above."):
             yield e
@@ -191,7 +198,15 @@ async def _wait_until_done(s: FakeSession, task_id: str) -> AsyncIterator[Event]
         if f"{task_id} · " in s.last_tool_output and " · running" not in \
                 s.last_tool_output.split("\n", 1)[0]:
             return
-        if "[team]" in s.last_tool_output:
+        if "\nWhile you were waiting" in s.last_tool_output:
+            said = s.last_tool_output.split("\nWhile you were waiting", 1)[1]
+            said = said.split("\n\n")[2].strip()
+            said = said if len(said) <= 60 else said[:59] + "…"
+            async for e in s.say(f"(demo) You said: “{said}”. A real Lead "
+                                 f"would answer that here. {task_id} is still running; "
+                                 "back to waiting."):
+                yield e
+        elif "[team]" in s.last_tool_output:
             async for e in s.say("The team changed; nothing to hand over yet, so I'll keep "
                                  "waiting."):
                 yield e
@@ -263,8 +278,9 @@ def fake_backend(brain: Brain = demo_brain, speed: float = 1.0):
     sessions: dict[str, FakeSession] = {}
 
     def factory(spec: AgentSpec) -> FakeSession:
-        sessions[spec.name] = FakeSession(spec, brain, speed)
-        return sessions[spec.name]
+        key = spec.name if spec.team == "main" else f"{spec.team}/{spec.name}"
+        sessions[key] = FakeSession(spec, brain, speed)
+        return sessions[key]
 
     factory.sessions = sessions  # type: ignore[attr-defined]
     return factory

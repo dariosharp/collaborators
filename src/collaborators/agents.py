@@ -61,6 +61,7 @@ class AgentSpec:
     disallowed_tools: list[str] = field(default_factory=list)
     tools: list[ToolSpec] = field(default_factory=list)
     approver: Approver | None = None
+    team: str = "main"
 
 
 @dataclass(frozen=True)

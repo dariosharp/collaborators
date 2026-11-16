@@ -10,12 +10,12 @@ from collaborators.ui.screens import AgentDetailScreen, ConfirmScreen, TaskBoard
 from collaborators.ui.widgets import AgentCard, LeadPanel
 
 
-async def wait_for(pilot, cond, timeout=10.0):
+async def wait_for(pilot, cond, timeout=10.0, state=None):
     for _ in range(int(timeout / 0.05)):
         if cond():
             return
         await pilot.pause(0.05)
-    raise AssertionError("condition not met")
+    raise AssertionError("condition not met" + (f": {state()}" if state else ""))
 
 
 async def test_demo_round_trip_and_shortcuts(tmp_path, monkeypatch):
@@ -98,6 +98,14 @@ async def test_slash_commands_and_ctrl_c(tmp_path, monkeypatch):
             await pilot.press("escape")
             assert not menu.display
 
+            # a click on an entry completes it too, and the input keeps the focus
+            inp.value = "/co"
+            await pilot.pause(0.1)
+            await pilot.click(menu, offset=(3, 2))  # 2nd entry: compact
+            await pilot.pause(0.1)
+            assert inp.value == "/compact " and not menu.display and inp.has_focus
+            inp.value = ""
+
             # unknown commands (and "/ model") are refused instead of being sent
             sent = len(app.backend.sessions["lead"].prompts)
             for text in ("/remote-controll", "/ model"):
@@ -135,4 +143,158 @@ async def test_slash_commands_and_ctrl_c(tmp_path, monkeypatch):
         assert not app.is_running
 
     # a hang on quit must fail the test, not stall the suite
+    await asyncio.wait_for(scenario(), timeout=60)
+
+
+async def test_wait_hourglass_turns_until_the_result():
+    from textual.app import App
+
+    from collaborators.events import ToolCall, ToolResult
+    from collaborators.ui.widgets import HOURGLASS, ToolEntry
+
+    call = ToolCall("lead", "t1", "mcp__team__wait_tasks", {"task_ids": ["T13"]})
+    entry = ToolEntry(call, None, expanded=False)
+
+    class Host(App):
+        def compose(self):
+            yield entry
+
+    async with Host().run_test() as pilot:
+        seen = set()
+        for _ in range(12):
+            seen.add(str(entry.render()).split()[0])
+            await pilot.pause(0.1)
+        assert len(seen) >= 3 and seen <= set(HOURGLASS)
+        entry.set_result(ToolResult("lead", "t1", "T13 · worker1 · done", False))
+        await pilot.pause(0.5)
+        assert str(entry.render()).startswith("⧗ Wait T13")
+
+
+async def test_teams_in_tabs(tmp_path, monkeypatch):
+    import json
+
+    from textual.widgets import TabbedContent
+
+    from collaborators.ui.screens import NameScreen
+    from collaborators.ui.team_view import TeamView
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    cfg = load_config(tmp_path / ".", {"workers": 1, "testers": 0})
+    backend = fake_backend(speed=20)
+
+    async def scenario() -> None:
+        app = CollabApp(cfg, backend)
+        # The pilot waits for animations after each key; the tab bar's can keep it
+        # waiting (the real app never waits on them).
+        app.animation_level = "none"
+        async with app.run_test(size=(140, 40)) as pilot:
+            await wait_for(pilot, lambda: app.team and app.team._lead_loop is not None)
+            tabs = app.query_one(TabbedContent)
+            assert tabs.has_class("-single")  # one team: no tab bar
+            await pilot.press("ctrl+n")
+            assert isinstance(app.screen, NameScreen)
+            inp = app.screen.query_one("#name-input")
+            assert inp.value == "frontend"
+            inp.value = "main"
+            await pilot.press("enter")
+            assert isinstance(app.screen, NameScreen)  # taken: refused
+            inp.value = "backend"
+            await pilot.press("enter")
+            await wait_for(pilot, lambda: app.view is not None
+                           and app.view.team_name == "backend"
+                           and app.team and app.team._lead_loop is not None,
+                           state=lambda: (tabs.active, app.screen, app.team,
+                                          app.team and app.team._lead_loop,
+                                          [v.team_name for v in app.views]))
+            assert not tabs.has_class("-single")
+            assert [v.team_name for v in app.views] == ["main", "backend"]
+            assert app.focused is app.view.query_one("#lead-input")
+
+            # each tab talks to its own Lead
+            app.view.query_one("#lead-input").value = "/model claude-opus-4-8"
+            await pilot.press("enter")
+            await wait_for(pilot, lambda: "/model claude-opus-4-8"
+                           in backend.sessions["backend/lead"].prompts)
+            assert backend.sessions["lead"].prompts == []
+
+            # a Lead's message shows up in the other tab
+            main = app.view_of("main")
+            app.hub.send(app.view.team, "main", "the API changed")
+            await wait_for(pilot, lambda: any(
+                "the API changed" in p for p in backend.sessions["lead"].prompts))
+            assert any("✉ from team backend" in str(getattr(e, "text", ""))
+                       for e in main.history["lead"])
+
+            await pilot.press("ctrl+g")
+            await wait_for(pilot, lambda: app.view is main, state=lambda: (
+                tabs.active, app.screen, app.focused, [v.team_name for v in app.views],
+                [w.name for w in app.workers]))
+            saved = json.loads((tmp_path / ".collab" / "tabs.json").read_text())
+            assert saved["teams"] == ["main", "backend"]
+
+            app.action_close_team("backend")
+            assert isinstance(app.screen, ConfirmScreen)
+            await pilot.press("y")
+            await wait_for(pilot, lambda: [v.team_name for v in app.views] == ["main"])
+            assert "backend" not in app.hub.teams
+            saved = json.loads((tmp_path / ".collab" / "tabs.json").read_text())
+            assert saved["teams"] == ["main"]
+            await app.action_quit()
+
+        # --resume reopens the tabs that were open, with their conversations
+        app2 = CollabApp(cfg, backend, resume=True)
+        app2.animation_level = "none"
+        (tmp_path / ".collab" / "tabs.json").write_text('{"teams": ["main", "backend"]}')
+        async with app2.run_test(size=(140, 40)) as pilot:
+            await wait_for(pilot, lambda: len(app2.views) == 2 and all(
+                v.team and v.team._lead_loop for v in app2.views))
+            assert app2.view.team_name == "main"
+            assert app2.view_of("backend").team.resumed == ["lead", "worker1"]
+            assert isinstance(app2.view_of("backend"), TeamView)
+            # (not pilot.press: it waits for the tab bar's animation, which quitting stops)
+            await app2.action_quit()
+        assert not app2.is_running and not app2.hub.teams
+
+    await asyncio.wait_for(scenario(), timeout=60)
+
+
+async def test_notification_diff_and_undo_from_the_task_board(tmp_path, monkeypatch):
+    from rich.syntax import Syntax
+    from test_orchestrator import git_repo, writing_brain
+    from textual.widgets import Static
+
+    from collaborators.ui import team_view
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setattr(team_view, "NOTIFY_AFTER_S", 0)
+    git_repo(tmp_path)
+    cfg = load_config(tmp_path, {"workers": 1, "testers": 0})
+    app = CollabApp(cfg, fake_backend(writing_brain({"A": [("app.py", "x = 1", "x = 10")]})))
+
+    async def scenario() -> None:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await wait_for(pilot, lambda: app.team and app.team._lead_loop is not None)
+            app.query_one("#lead-input").value = "hello"
+            await pilot.press("enter")
+            await wait_for(pilot, lambda: app.sent_notifications)
+            assert app.sent_notifications == ["collab: ok"]
+
+            app.view.send_direct("worker1", "A")
+            await wait_for(pilot, lambda: app.tasks and all(
+                t.status.finished for t in app.tasks.values()))
+            assert (tmp_path / "app.py").read_text().startswith("x = 10")
+            await pilot.press("ctrl+t")
+            await pilot.pause(0.2)
+            body = app.screen.query_one("#board-report-body", Static)
+            await pilot.press("d")
+            await wait_for(pilot, lambda: isinstance(body.content, Syntax))
+            assert "+x = 10" in body.content.code
+            await pilot.press("u")
+            assert isinstance(app.screen, ConfirmScreen)
+            await pilot.press("y")
+            await wait_for(pilot, lambda: app.tasks["T1"].undone)
+            assert (tmp_path / "app.py").read_text().startswith("x = 1\n")
+            await pilot.press("escape")
+            await pilot.press("ctrl+q")
+
     await asyncio.wait_for(scenario(), timeout=60)
