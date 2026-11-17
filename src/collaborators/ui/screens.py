@@ -66,7 +66,7 @@ class AgentDetailScreen(Screen[None]):
         if event.agent == self.agent:
             self.query_one(Transcript).feed(event)
 
-    def on_input_submitted(self, event: Input.Submitted) -> None:
+    def on_command_input_submitted(self, event: CommandInput.Submitted) -> None:
         text = event.value.strip()
         if text:
             event.input.value = ""
@@ -329,6 +329,7 @@ work streams live into its card.
 | Key | Action |
 |---|---|
 | `Enter` | send your message to the Lead (or open the focused agent card) |
+| `Ctrl+J` or `\\` `Enter` | new line in your message (also `Shift+Enter` in kitty, WezTerm, …) |
 | `Tab` / `Shift+Tab` | move focus between the Lead and the agent cards |
 | `Ctrl+O` | open the full transcript of the focused agent |
 | `F2` / `F3` | add a worker / a tester — the Lead is told immediately |
@@ -338,7 +339,7 @@ work streams live into its card.
 | `Ctrl+P` | command palette (add or remove agents, themes, …) |
 | `/` | slash commands and skills (yours and the project's): `↑`/`↓` choose, `Tab` completes |
 | `/remote-control` | continue with the Lead from claude.ai/code or the Claude app (`off` to stop) |
-| `↑` / `↓` | browse your previous messages in the Lead input |
+| `↑` / `↓` | browse your previous messages (from the first / last line of the input) |
 | `Ctrl+N` | open a new team in a new tab (its own Lead, workers and testers) |
 | `Ctrl+G` | go to the next team's tab (or click the tab) |
 | `F1` | this help |

@@ -21,6 +21,7 @@ from ..config import DEFAULT_TEAM, ConfigError, TeamConfig, check_team_name
 from ..events import Event, TaskRecord
 from ..orchestrator import Hub, Team
 from ..state import has_saved_team, load_open_teams, save_open_teams
+from .commands import CommandInput
 from .screens import ConfirmScreen, HelpScreen, NameScreen, TaskBoardScreen
 from .team_view import REMOTE_CMD, TeamView
 from .theme import THEMES
@@ -355,7 +356,7 @@ class CollabApp(App[None]):
     async def action_ctrl_c(self) -> None:
         """Like Claude Code: Ctrl+C clears what you are typing; pressed twice, it quits."""
         focused = self.focused
-        if isinstance(focused, Input) and focused.value:
+        if isinstance(focused, (Input, CommandInput)) and focused.value:
             focused.value = ""
             return
         now = time.monotonic()

@@ -15,7 +15,7 @@ from textual.containers import Vertical, VerticalScroll
 from textual.message import Message
 from textual.reactive import reactive
 from textual.timer import Timer
-from textual.widgets import Input, Static
+from textual.widgets import Static
 
 from ..agents import Command
 from ..events import (
@@ -356,8 +356,6 @@ class LeadPanel(Vertical):
         self.workdir = workdir
         self.placeholder = placeholder
         self.cost = 0.0
-        self._history: list[str] = []
-        self._hpos = 0
         self._frame = 0
 
     def compose(self) -> ComposeResult:
@@ -421,28 +419,12 @@ class LeadPanel(Vertical):
         log._add(Entry(msg), "user")
         log.call_after_refresh(log.scroll_end, animate=False)
 
-    def on_input_submitted(self, event: Input.Submitted) -> None:
+    def on_command_input_submitted(self, event: CommandInput.Submitted) -> None:
         text = event.value.strip()
         if not text:
             return
         event.input.value = ""
-        self._history.append(text)
-        self._hpos = len(self._history)
         self.post_message(self.Submitted(text))
-
-    def on_key(self, event: Any) -> None:
-        inp = self.query_one(CommandInput)
-        if not inp.has_focus or not self._history or inp.menu_open:
-            return
-        if event.key == "up":
-            self._hpos = max(0, self._hpos - 1)
-        elif event.key == "down":
-            self._hpos = min(len(self._history), self._hpos + 1)
-        else:
-            return
-        inp.value = self._history[self._hpos] if self._hpos < len(self._history) else ""
-        inp.cursor_position = len(inp.value)
-        event.stop()
 
 
 # ---- bars ----------------------------------------------------------------------

@@ -55,6 +55,7 @@ Then describe what you want, e.g.
 | Key | Action |
 |---|---|
 | `Enter` | send your message to the Lead / open the focused agent |
+| `Ctrl+J` or `\` `Enter` | **new line** in your message (also `Shift+Enter` in terminals that report it: kitty, WezTerm, Ghostty, foot, iTerm2) |
 | `/` | **Claude Code slash commands and skills** (yours and the project's), with completion: `↑`/`↓` choose, `Tab` completes — to the Lead, or to one agent from its transcript |
 | `/remote-control` | **continue with the Lead from claude.ai/code or the Claude app**; `/remote-control off` stops it (or start with `collab --remote-control`) |
 | `F2` / `F3` | **add a worker / a tester** — the Lead is told immediately and can use it at once |

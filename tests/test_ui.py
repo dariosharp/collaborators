@@ -298,3 +298,33 @@ async def test_notification_diff_and_undo_from_the_task_board(tmp_path, monkeypa
             await pilot.press("ctrl+q")
 
     await asyncio.wait_for(scenario(), timeout=60)
+
+
+async def test_multiline_input(tmp_path, monkeypatch):
+    from collaborators.ui.commands import CommandInput
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    cfg = load_config(tmp_path / ".", {"workers": 1, "testers": 0})
+    app = CollabApp(cfg, fake_backend(speed=20))
+    async with app.run_test(size=(140, 40)) as pilot:
+        await wait_for(pilot, lambda: app.team and app.team._lead_loop is not None)
+        inp = app.query_one("#lead-input", CommandInput)
+        inp.focus()
+        sent: list[str] = []
+        monkeypatch.setattr(app.team, "tell_lead", lambda text, chat=True: sent.append(text))
+        # Shift+Enter, Ctrl+J and `\` + Enter all start a new line; Enter sends.
+        await pilot.press(*"one", "shift+enter", *"two", "ctrl+j", *"three\\", "enter", *"four")
+        assert inp.value == "one\ntwo\nthree\nfour"
+        await pilot.press("enter")
+        await wait_for(pilot, lambda: sent == ["one\ntwo\nthree\nfour"])
+        assert inp.value == ""
+        # Up recalls it; on a later line Up moves the cursor; Down past the end
+        # brings back what was being typed.
+        await pilot.press(*"draft", "up")
+        assert inp.value == "one\ntwo\nthree\nfour"
+        await pilot.press("up")
+        assert inp.value == "one\ntwo\nthree\nfour" and inp.cursor_location[0] == 2
+        await pilot.press("down", "down")
+        assert inp.value == "draft"
+        await pilot.press("ctrl+c")
+        assert inp.value == "" and app.is_running

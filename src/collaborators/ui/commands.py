@@ -1,4 +1,5 @@
-"""An input with Claude Code style `/` completion for slash commands and skills."""
+"""A multi-line prompt box with Claude Code style `/` completion for slash commands
+and skills."""
 
 from __future__ import annotations
 
@@ -6,7 +7,8 @@ from collections.abc import Callable
 
 from rich.text import Text
 from textual import events
-from textual.widgets import Input, OptionList
+from textual.message import Message
+from textual.widgets import OptionList, TextArea
 from textual.widgets.option_list import Option
 
 from ..agents import Command
@@ -62,15 +64,55 @@ class CommandMenu(OptionList):
         return self.commands[self.highlighted]
 
 
-class CommandInput(Input):
-    """Typing `/` lists the agent's slash commands and skills. Up/Down choose,
-    Tab or Enter (or a click) completes, Esc closes the list; Enter again sends."""
+class CommandInput(TextArea):
+    """The prompt box: it grows with what you type, up to a few lines.
+
+    Enter sends. Shift+Enter, Ctrl+J, or a `\\` right before Enter start a new line
+    instead (Shift+Enter only where the terminal reports it: kitty, WezTerm,
+    Ghostty, foot, iTerm2; elsewhere it arrives as a plain Enter).
+
+    Typing `/` lists the agent's slash commands and skills. Up/Down choose,
+    Tab or Enter (or a click) completes, Esc closes the list; Enter again sends.
+    Up on the first line and Down on the last one walk through what you sent.
+    """
+
+    # Ctrl+X interrupts and Ctrl+C clears/quits in the app: TextArea's cut/copy
+    # bindings on those keys would swallow them.
+    BINDINGS = [b for b in TextArea.BINDINGS
+                if not {"ctrl+x", "ctrl+c"} & set(b.key.split(","))]
+    inherit_bindings = False
+
+    NEWLINE_KEYS = ("shift+enter", "ctrl+j", "shift+\r")
+
+    class Submitted(Message):
+        def __init__(self, input: CommandInput, value: str) -> None:
+            super().__init__()
+            self.input = input
+            self.value = value
+
+        @property
+        def control(self) -> CommandInput:
+            return self.input
 
     def __init__(self, commands: Callable[[], list[Command]], *, menu_id: str,
-                 **kwargs) -> None:
-        super().__init__(**kwargs)
+                 value: str = "", placeholder: str = "", **kwargs) -> None:
+        super().__init__(value, placeholder=placeholder, soft_wrap=True,
+                         highlight_cursor_line=False, classes="command-input", **kwargs)
         self._commands = commands
         self.menu_id = menu_id
+        self.sent: list[str] = []  # messages sent from here, for Up/Down
+        self._hpos = 0
+        self._draft = ""
+
+    @property
+    def value(self) -> str:
+        return self.text
+
+    @value.setter
+    def value(self, value: str) -> None:
+        self.text = value
+        self.move_cursor(self.document.end)
+        self._update_menu()
 
     @property
     def menu(self) -> CommandMenu:
@@ -84,13 +126,13 @@ class CommandInput(Input):
 
     def _update_menu(self) -> None:
         value = self.value
-        if value.startswith("/") and " " not in value:
+        if value.startswith("/") and not any(c.isspace() for c in value):
             self.menu.show(matching(self._commands(), value[1:]))
         else:
             self.menu.hide()
 
-    def on_input_changed(self, event: Input.Changed) -> None:
-        if event.input is self:
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        if event.text_area is self:
             self._update_menu()
 
     def on_blur(self) -> None:
@@ -101,7 +143,6 @@ class CommandInput(Input):
         if cmd is None:
             return False
         self.value = f"/{cmd.name} "
-        self.cursor_position = len(self.value)
         self.menu.hide()
         return True
 
@@ -112,24 +153,55 @@ class CommandInput(Input):
             self._complete()
         self.focus()
 
+    def _newline(self) -> None:
+        start, end = self.selection
+        self.replace("\n", start, end)
+
+    def _browse_history(self, step: int) -> bool:
+        """Up/Down through what was sent. Returns False when there is nowhere to go."""
+        pos = self._hpos + step
+        if not self.sent or pos < 0 or pos > len(self.sent) or pos == self._hpos:
+            return False
+        if self._hpos == len(self.sent):
+            self._draft = self.value  # keep what was being typed
+        self._hpos = pos
+        self.value = self.sent[pos] if pos < len(self.sent) else self._draft
+        return True
+
     async def _on_key(self, event: events.Key) -> None:
-        if self.menu_open:
+        key = event.key
+        handled = True
+        row, col = self.cursor_location
+        if self.menu_open and key in ("down", "up", "tab", "escape"):
             menu = self.menu
-            handled = True
-            if event.key == "down":
+            if key == "down":
                 menu.action_cursor_down()
-            elif event.key == "up":
+            elif key == "up":
                 menu.action_cursor_up()
-            elif event.key == "tab":
+            elif key == "tab":
                 self._complete()
-            elif event.key == "escape":
-                menu.hide()
             else:
-                handled = False
-            if handled:
-                event.stop()
-                event.prevent_default()
-                return
+                menu.hide()
+        elif key in self.NEWLINE_KEYS:
+            self._newline()
+        elif key == "enter":
+            line = self.document.get_line(row)
+            if (not self.menu_open and self.selection.is_empty and col > 0
+                    and line[col - 1] == "\\"):
+                # `\` + Enter: a new line, in any terminal (as in Claude Code).
+                self.replace("\n", (row, col - 1), (row, col))
+            else:
+                await self.action_submit()
+        elif key == "up" and row == 0:
+            handled = self._browse_history(-1)
+        elif key == "down" and row == self.document.line_count - 1:
+            handled = self._browse_history(+1)
+        else:
+            handled = False
+        if handled:
+            event.stop()
+            event.prevent_default()
+            return
         await super()._on_key(event)
 
     async def action_submit(self) -> None:
@@ -139,4 +211,9 @@ class CommandInput(Input):
             self._complete()
             return
         self.menu.hide()
-        await super().action_submit()
+        text = self.value
+        if text.strip():
+            self.sent.append(text.strip())
+        self._hpos = len(self.sent)
+        self._draft = ""
+        self.post_message(self.Submitted(self, text))

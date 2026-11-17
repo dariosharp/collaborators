@@ -162,6 +162,12 @@ Entry.result {
     color: $success;
 }
 
+/* The prompt boxes grow with the text, up to a few lines, then scroll. */
+.command-input {
+    height: auto;
+    max-height: 10;
+    padding: 0 1;
+}
 #lead-input {
     margin: 0 0;
     border: tall $primary 40%;
