@@ -7,7 +7,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from . import __version__
+from . import __version__, accounts
 from .config import EFFORTS, PERMISSION_MODES, ConfigError, load_config
 
 DEMO_PROMPT = "Add a --dry-run flag to scripts/import_data.py and make sure it never writes files"
@@ -39,6 +39,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="no desktop notification when the Lead finishes a long turn")
     p.add_argument("--remote-control", action="store_true",
                    help="make the Lead controllable from claude.ai/code and the Claude app")
+    p.add_argument("--account", default=None, metavar="NAME",
+                   help="Claude account to run the agents under (see /switch; "
+                        "default: the last one used)")
     p.add_argument("--demo", action="store_true",
                    help="scripted demo: no API calls, no cost, runs in a temp directory")
     p.add_argument("--version", action="version", version=f"collaborators {__version__}")
@@ -69,6 +72,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"collab: {exc}", file=sys.stderr)
         return 2
 
+    account = None
+    if args.account:
+        try:
+            accounts.env_for(args.account.strip().lower())
+            account = args.account.strip().lower()
+            accounts.set_current(account)
+        except ConfigError as exc:
+            print(f"collab: {exc}", file=sys.stderr)
+            return 2
+
     if args.demo:
         from .backend_fake import fake_backend
         backend = fake_backend()
@@ -84,7 +97,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from .ui.app import CollabApp
     CollabApp(cfg, backend, resume=args.resume, initial_prompt=initial,
-              mode_label=label, remote_control=args.remote_control).run()
+              mode_label=label, remote_control=args.remote_control, account=account).run()
     return 0
 
 

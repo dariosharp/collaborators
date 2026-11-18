@@ -95,11 +95,14 @@ class CommandInput(TextArea):
             return self.input
 
     def __init__(self, commands: Callable[[], list[Command]], *, menu_id: str,
-                 value: str = "", placeholder: str = "", **kwargs) -> None:
+                 value: str = "", placeholder: str = "", escape_to_normal: bool = False,
+                 **kwargs) -> None:
         super().__init__(value, placeholder=placeholder, soft_wrap=True,
                          highlight_cursor_line=False, classes="command-input", **kwargs)
         self._commands = commands
         self.menu_id = menu_id
+        # Vim style: Esc (with no menu open) leaves the input for the log next to it.
+        self.escape_to_normal = escape_to_normal
         self.sent: list[str] = []  # messages sent from here, for Up/Down
         self._hpos = 0
         self._draft = ""
@@ -182,6 +185,12 @@ class CommandInput(TextArea):
                 self._complete()
             else:
                 menu.hide()
+        elif key == "escape" and self.escape_to_normal and self.parent is not None:
+            log = self.parent.query(".transcript")
+            if log:
+                log.first().focus()
+            else:
+                self.screen.set_focus(None)
         elif key in self.NEWLINE_KEYS:
             self._newline()
         elif key == "enter":

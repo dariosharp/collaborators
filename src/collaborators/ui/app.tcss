@@ -294,3 +294,40 @@ ApprovalScreen, HelpScreen, ConfirmScreen {
 .command-menu > .option-list--option-highlighted {
     background: $primary 30%;
 }
+
+/* ---- accounts ----------------------------------------------------------------- */
+#confirm.account {
+    border: thick $primary 70%;
+}
+#account-list {
+    height: auto;
+    max-height: 12;
+    margin-top: 1;
+}
+#account-keys {
+    margin-top: 1;
+}
+#token-input {
+    margin-top: 1;
+}
+
+/* ---- vim mode line --------------------------------------------------------------- */
+#modeline {
+    height: 1;
+    background: $panel;
+}
+#mode {
+    width: auto;
+    max-width: 100%;
+    padding: 0 1;
+}
+#cmdline {
+    width: 1fr;
+    height: 1;
+    border: none;
+    padding: 0;
+    background: $panel;
+}
+#cmdline:focus {
+    border: none;
+}

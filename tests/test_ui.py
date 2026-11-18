@@ -109,8 +109,8 @@ async def test_slash_commands_and_ctrl_c(tmp_path, monkeypatch):
             # unknown commands (and "/ model") are refused instead of being sent
             sent = len(app.backend.sessions["lead"].prompts)
             for text in ("/remote-controll", "/ model"):
-                inp.value = text
-                await pilot.press("escape", "enter")
+                inp.value = text  # no menu for these: Enter sends (and is refused)
+                await pilot.press("enter")
                 await pilot.pause(0.1)
             assert len(app.backend.sessions["lead"].prompts) == sent
 
@@ -328,3 +328,49 @@ async def test_multiline_input(tmp_path, monkeypatch):
         assert inp.value == "draft"
         await pilot.press("ctrl+c")
         assert inp.value == "" and app.is_running
+
+
+async def test_switch_account_and_limit_prompt(tmp_path, monkeypatch):
+    from collaborators import accounts
+    from collaborators.backend_fake import LIMIT_MARK
+    from collaborators.ui.commands import CommandInput
+    from collaborators.ui.widgets import TopBar
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    accounts.add("work", "tok-work")
+    cfg = load_config(tmp_path / ".", {"workers": 1, "testers": 0})
+    app = CollabApp(cfg, fake_backend(speed=20))
+    sessions = app.backend.sessions
+    async with app.run_test(size=(140, 40)) as pilot:
+        await wait_for(pilot, lambda: app.team and app.team._lead_loop is not None)
+        assert app.account == "login" and app.query_one(TopBar).account == "login"
+        inp = app.query_one("#lead-input", CommandInput)
+        inp.focus()
+
+        # The Lead hits the usage limit: collab offers the other account; y switches.
+        inp.value = f"hello {LIMIT_MARK}"
+        await pilot.press("enter")
+        await wait_for(pilot, lambda: isinstance(app.screen, ConfirmScreen))
+        await pilot.press("y")
+        await wait_for(pilot, lambda: app.team.account == "work"
+                       and sessions["lead"].spec.env == {"CLAUDE_CODE_OAUTH_TOKEN": "tok-work"})
+        assert sessions["lead"].spec.resume and app.query_one(TopBar).account == "work"
+        assert accounts.current() == "work"
+        # …and the Lead is told to carry on, under the new account.
+        await wait_for(pilot, lambda: any("carry on" in p for p in sessions["lead"].prompts))
+
+        # /switch <name> goes straight back.
+        inp.focus()
+        inp.value = "/switch login"
+        await pilot.press("enter")
+        await wait_for(pilot, lambda: app.team.account == "login"
+                       and sessions["lead"].spec.env == {})
+        assert sessions["worker1"].spec.env == {}
+
+        # /switch alone opens the account picker.
+        inp.focus()
+        inp.value = "/switch"
+        await pilot.press("escape", "enter")
+        await wait_for(pilot, lambda: type(app.screen).__name__ == "AccountScreen")
+        await pilot.press("escape")

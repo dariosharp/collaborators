@@ -118,6 +118,14 @@ class TurnResult(Event):
     input_tokens: int = 0
     output_tokens: int = 0
     session_id: str | None = None
+    limited: bool = False  # stopped because the account hit its usage limit
+
+
+@dataclass(frozen=True)
+class LimitReached(Event):
+    """The account the agent runs under hit its usage limit."""
+    resets_at: int | None = None  # unix time
+    kind: str = ""  # five_hour, seven_day, …
 
 
 @dataclass(frozen=True)
@@ -151,6 +159,7 @@ class TaskRecord:
     overlapped: bool = False  # other tasks changed the same tree at the same time
     undone: bool = False
     merged: bool = False  # a worker task whose worktree changes reached the main directory
+    limited: bool = False  # stopped because the account hit its usage limit
 
     @property
     def elapsed(self) -> float:
@@ -179,7 +188,7 @@ class TaskRecord:
             "warnings": self.warnings, "where": self.where,
             "snap_before": self.snap_before, "snap_after": self.snap_after,
             "changed_files": self.changed_files, "overlapped": self.overlapped,
-            "undone": self.undone, "merged": self.merged,
+            "undone": self.undone, "merged": self.merged, "limited": self.limited,
         }
 
 

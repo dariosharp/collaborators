@@ -564,3 +564,68 @@ async def test_workers_in_worktrees_and_merge(tmp_path):
                          text=True).stdout
     assert log.count("\n") == 1
     await team.shutdown()
+
+
+def limit_brain(gates: dict[str, asyncio.Event]):
+    """Workers stop at the usage limit unless they run under an account (an env)."""
+
+    async def brain(s: FakeSession, prompt: str) -> AsyncIterator[Event]:
+        if s.spec.role == "lead":
+            yield s.done("ok")
+            return
+        gate = gates.get(s.name)
+        if gate:
+            await gate.wait()
+        if not s.spec.env:
+            async for e in s.hit_limit():
+                yield e
+            return
+        yield s.done(f"{s.name} finished: {prompt}")
+
+    return brain
+
+
+async def test_switch_account_keeps_conversations(tmp_path):
+    team, events, sessions = make_team(tmp_path, gated_brain({}), workers=1, testers=0)
+    await team.start()
+    team.tell_lead("hello")
+    await settle(team)
+    old = {name: s.session_id for name, s in sessions.items()}
+    await team.switch_account("work", {"CLAUDE_CODE_OAUTH_TOKEN": "tok"})
+    for name, s in sessions.items():
+        assert s.spec.env == {"CLAUDE_CODE_OAUTH_TOKEN": "tok"} and s.connected
+        assert s.session_id == old[name]
+    # Only agents that already talked resume; the others start their (same) session.
+    assert sessions["lead"].spec.resume and not sessions["worker1"].spec.resume
+    assert team.account == "work"
+    name = await team.add_agent("worker")
+    assert sessions[name].spec.env == {"CLAUDE_CODE_OAUTH_TOKEN": "tok"}
+    await team.shutdown()
+
+
+async def test_busy_agent_switches_after_its_turn_and_lead_hears_of_limits(tmp_path):
+    gate = asyncio.Event()
+    team, events, sessions = make_team(tmp_path, limit_brain({"worker1": gate}),
+                                       workers=2, testers=0)
+    await team.start()
+    t1 = team.dispatch("worker1", "build it")
+    t2 = team.dispatch("worker2", "build that")
+    await asyncio.sleep(0)
+    await team.wait([t2.id])
+    assert t2.limited and t2.status is TaskStatus.FAILED
+    switching = asyncio.create_task(team.switch_account("work", {"T": "x"}))
+    for _ in range(50):
+        await asyncio.sleep(0)
+    assert sessions["worker2"].spec.env == {"T": "x"}   # idle: switched already
+    assert sessions["worker1"].spec.env == {}           # busy: still on the old account
+    gate.set()
+    await switching
+    assert t1.limited and sessions["worker1"].spec.env == {"T": "x"}
+    await settle(team)
+    told = [p for p in sessions["lead"].prompts if "usage limit" in p]
+    assert told and "T1 (worker1)" in told[0] and "T2 (worker2)" in told[0]
+    # Told once: a second switch has nothing new to report.
+    await team.switch_account("login", {})
+    await settle(team)
+    assert not [p for p in sessions["lead"].prompts if "usage limit" in p]
+    await team.shutdown()

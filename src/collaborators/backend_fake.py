@@ -12,7 +12,19 @@ from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from .agents import AgentSpec, Command
-from .events import Event, TextDelta, TextDone, Thinking, ToolCall, ToolResult, TurnResult
+from .events import (
+    Event,
+    LimitReached,
+    TextDelta,
+    TextDone,
+    Thinking,
+    ToolCall,
+    ToolResult,
+    TurnResult,
+)
+
+# A prompt containing this plays a turn cut off by the account's usage limit.
+LIMIT_MARK = "[demo:limit]"
 
 # A brain turns (session, prompt) into a stream of events. It must end with a TurnResult.
 Brain = Callable[["FakeSession", str], AsyncIterator[Event]]
@@ -106,6 +118,13 @@ class FakeSession:
         self.last_tool_output = out
         yield ToolResult(self.name, tid, out, out.startswith("ERROR"))
 
+    async def hit_limit(self) -> AsyncIterator[Event]:
+        yield LimitReached(self.name, None, "five_hour")
+        text = "You've hit your limit (demo)."
+        yield TextDone(self.name, text)
+        yield TurnResult(self.name, text, is_error=True, subtype="error", limited=True,
+                         session_id=self.session_id)
+
     def done(self, text: str, cost: float = 0.0, turns: int = 1) -> TurnResult:
         return TurnResult(self.name, text, cost_usd=cost, num_turns=turns,
                           duration_ms=0, input_tokens=1200 * turns, output_tokens=300 * turns,
@@ -115,6 +134,10 @@ class FakeSession:
 # ---- the demo script ----------------------------------------------------------
 
 async def demo_brain(s: FakeSession, prompt: str) -> AsyncIterator[Event]:
+    if LIMIT_MARK in prompt and not s.spec.env:  # another account (an env) goes on
+        async for e in s.hit_limit():
+            yield e
+        return
     if prompt.startswith("/model"):
         arg = prompt.removeprefix("/model").strip()
         text = (f"Set model to `{arg}` for this session only" if arg else

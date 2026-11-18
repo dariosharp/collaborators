@@ -10,8 +10,9 @@ event to the UI.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -62,6 +63,7 @@ class AgentSpec:
     tools: list[ToolSpec] = field(default_factory=list)
     approver: Approver | None = None
     team: str = "main"
+    env: dict[str, str] = field(default_factory=dict)  # e.g. the account's token
 
 
 @dataclass(frozen=True)
@@ -104,6 +106,11 @@ class AgentRunner:
         self.task_id: str | None = None
         self.last_touched: list[str] = []
         self.total_cost = 0.0
+        self.last_limited = False  # its last turn stopped at the account's usage limit
+        self._ran = spec.resume    # its conversation exists, so it can be resumed
+        self._attach(session)
+
+    def _attach(self, session: AgentSession) -> None:
         if hasattr(session, "on_remote"):
             session.on_remote = self._on_remote  # type: ignore[attr-defined]
 
@@ -113,6 +120,7 @@ class AgentRunner:
             self._set_status(AgentStatus.RUNNING)
         self._emit(event)
         if isinstance(event, TurnResult):
+            self._ran = True
             self.total_cost += event.cost_usd
             if not self.busy:
                 self._set_status(AgentStatus.IDLE)
@@ -174,8 +182,25 @@ class AgentRunner:
             if result is None:
                 result = TurnResult(self.name, "the agent stopped without a result",
                                     is_error=True, subtype="no_result")
+            self._ran = True
+            self.last_limited = result.limited
             self.total_cost += result.cost_usd
             return result
+
+    async def reconnect(self, backend: Backend, **changes: Any) -> None:
+        """Start a new session for the same conversation with `changes` to the spec
+        (e.g. another account's environment). Waits for the turn in progress to end."""
+        if self.busy:
+            self._emit(Notice(self.name, f"{self.name} switches account when this turn ends"))
+        async with self._lock:
+            self.spec = replace(self.spec, session_id=self.session.session_id,
+                                resume=self._ran, **changes)
+            old, self.session = self.session, backend(self.spec)
+            self._attach(self.session)
+            with contextlib.suppress(Exception):
+                await old.close()
+            self.last_limited = False
+            await self.start()
 
     async def interrupt(self) -> None:
         if self.busy or getattr(self.session, "remote_turn", False):

@@ -12,6 +12,7 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    RateLimitEvent,
     ResultMessage,
     SystemMessage,
     TextBlock,
@@ -32,6 +33,7 @@ from claude_agent_sdk.types import (
 from .agents import AgentSpec, Command, ToolSpec
 from .events import (
     Event,
+    LimitReached,
     Notice,
     TextDelta,
     TextDone,
@@ -95,6 +97,7 @@ class SdkSession:
         self._local_pending = 0   # our queries whose turn hasn't finished
         self._in_turn = False
         self._turn_is_remote = False
+        self._limited = False  # this turn hit the usage limit
         self._idle = asyncio.Event()
         self._idle.set()
 
@@ -115,6 +118,8 @@ class SdkSession:
             # The user's and the project's skills, usable by the agent and as /commands.
             skills="all",
         )
+        if spec.env:
+            kwargs["env"] = dict(spec.env)  # the account to run under (see accounts.py)
         if spec.resume:
             kwargs["resume"] = spec.session_id
         else:
@@ -230,6 +235,12 @@ class SdkSession:
         last_text = ""
         try:
             async for msg in self._client.receive_messages():
+                if isinstance(msg, RateLimitEvent):
+                    info = msg.rate_limit_info
+                    # Rejected with pay-as-you-go overage allowed: work goes on.
+                    if info.status == "rejected" and info.overage_status != "allowed":
+                        self._hit_limit(info.resets_at, info.rate_limit_type or "")
+                    continue
                 if not self._in_turn:
                     starts = isinstance(msg, (StreamEvent, AssistantMessage, UserMessage)) or (
                         isinstance(msg, SystemMessage) and msg.subtype == "init")
@@ -248,6 +259,8 @@ class SdkSession:
                         if delta.get("type") == "text_delta" and delta.get("text"):
                             self._deliver(TextDelta(name, delta["text"]))
                 elif isinstance(msg, AssistantMessage):
+                    if getattr(msg, "error", None) == "rate_limit":
+                        self._hit_limit(None, "")
                     for block in msg.content:
                         if isinstance(block, TextBlock):
                             last_text = block.text
@@ -275,6 +288,7 @@ class SdkSession:
                         # a scheduled prompt, …) — not the answer to our prompt.
                         self._turn_is_remote = True
                     self._deliver(self._turn_result(msg, last_text))
+                    self._limited = False
                     if not self._turn_is_remote:
                         self._local_pending = max(0, self._local_pending - 1)
                     self._in_turn = False
@@ -289,6 +303,18 @@ class SdkSession:
             self._deliver(None)
             self._in_turn = False
             self._idle.set()
+
+    def _hit_limit(self, resets_at: int | None, kind: str) -> None:
+        """Once per turn: tell the UI the account is out of usage."""
+        if self._limited:
+            return
+        self._limited = True
+        event = LimitReached(self.spec.name, resets_at, kind)
+        if self._turn_is_remote or self._turn_queue is None:
+            if self.on_remote is not None:
+                self.on_remote(event)
+        else:
+            self._turn_queue.put_nowait(event)
 
     def _turn_result(self, msg: ResultMessage, last_text: str) -> TurnResult:
         total = msg.total_cost_usd or 0.0
@@ -309,6 +335,7 @@ class SdkSession:
             + int(usage.get("cache_creation_input_tokens", 0) or 0),
             output_tokens=int(usage.get("output_tokens", 0) or 0),
             session_id=msg.session_id,
+            limited=self._limited and msg.is_error,
         )
 
 

@@ -115,3 +115,37 @@ async def test_our_prompt_waits_for_a_turn_started_elsewhere(tmp_path):
     got = await asyncio.wait_for(run, 5)
     assert client.queries == ["next"] and got.text == "answer to next"
     await session.close()
+
+
+async def test_usage_limit_is_reported(tmp_path):
+    from claude_agent_sdk import RateLimitEvent
+    from claude_agent_sdk.types import RateLimitInfo
+
+    from collaborators.events import LimitReached
+
+    session, client, runner, events = make(tmp_path)
+
+    def limit(status: str, overage: str | None = None) -> RateLimitEvent:
+        return RateLimitEvent(RateLimitInfo(status=status, resets_at=1700000000,
+                                            rate_limit_type="five_hour",
+                                            overage_status=overage), uuid="u", session_id="s")
+
+    async def query(prompt: str) -> None:
+        client.queries.append(prompt)
+        client.out.put_nowait(limit("allowed_warning"))
+        client.out.put_nowait(limit("rejected", overage="allowed"))  # pay-as-you-go: fine
+        client.out.put_nowait(limit("rejected"))
+        client.out.put_nowait(say("You've hit your limit"))
+        client.out.put_nowait(ResultMessage(
+            subtype="success", duration_ms=1, duration_api_ms=1, is_error=True, num_turns=1,
+            session_id="s", total_cost_usd=0, result="You've hit your limit", usage={}))
+
+    client.query = query  # type: ignore[method-assign]
+    got = await runner.run("go")
+    assert got.limited and got.is_error
+    hits = [e for e in events if isinstance(e, LimitReached)]
+    assert len(hits) == 1 and hits[0].resets_at == 1700000000 and hits[0].kind == "five_hour"
+    # the next turn starts clean
+    client.query = FakeClient.query.__get__(client)  # type: ignore[method-assign]
+    assert not (await runner.run("again")).limited
+    await session.close()

@@ -21,6 +21,7 @@ from ..agents import Command
 from ..events import (
     AgentStatus,
     Event,
+    LimitReached,
     Notice,
     TaskRecord,
     TaskStatus,
@@ -141,6 +142,7 @@ class Transcript(VerticalScroll):
     def __init__(self, *, expanded: bool, workdir: Path | None, show_prompts: bool = True,
                  markdown: bool | None = None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
+        self.add_class("transcript")
         self.expanded = expanded
         self.markdown = expanded if markdown is None else markdown
         self.workdir = workdir
@@ -194,6 +196,10 @@ class Transcript(VerticalScroll):
         elif isinstance(event, TurnResult):
             self._stream = None
             self._result(event)
+        elif isinstance(event, LimitReached):
+            self._stream = None
+            self._add(Entry(Text("▸ the Claude account hit its usage limit — /switch to "
+                                 "another one")), "notice", "warning")
         elif isinstance(event, Notice):
             style = {"warning": "warning", "error": "error"}.get(event.level, "")
             self._add(Entry(Text("▸ " + event.text)), "notice", *([style] if style else []))
@@ -211,7 +217,8 @@ class Transcript(VerticalScroll):
 
     def _result(self, event: TurnResult) -> None:
         if event.is_error:
-            msg = Text(f"✗ {event.subtype}", style="bold")
+            msg = Text("✗ usage limit" if event.limited else f"✗ {event.subtype}",
+                       style="bold")
             if event.text and event.subtype in ("exception", "no_result"):
                 msg.append(f"  {event.text}")
             self._add(Entry(msg), "result", "error")
@@ -363,7 +370,7 @@ class LeadPanel(Vertical):
         yield Transcript(expanded=False, markdown=True, workdir=self.workdir,
                          show_prompts=False, id="lead-log")
         yield CommandMenu(id="lead-input-menu")
-        yield CommandInput(self.commands, menu_id="lead-input-menu",
+        yield CommandInput(self.commands, menu_id="lead-input-menu", escape_to_normal=True,
                            placeholder="Describe what you want built, or / for commands and "
                                        "skills…", id="lead-input", value=self.placeholder)
 
@@ -430,10 +437,15 @@ class LeadPanel(Vertical):
 # ---- bars ----------------------------------------------------------------------
 
 class TopBar(Static):
-    def __init__(self, workdir: Path, summary: str) -> None:
+    def __init__(self, workdir: Path, summary: str, account: str = "") -> None:
         super().__init__(id="topbar")
         self.workdir = workdir
         self.summary = summary
+        self.account = account  # shown when there is more than Claude Code's own login
+
+    def set_account(self, account: str) -> None:
+        self.account = account
+        self.on_mount()
 
     def set_summary(self, summary: str) -> None:
         self.summary = summary
@@ -446,6 +458,8 @@ class TopBar(Static):
         t = Text(no_wrap=True, overflow="ellipsis")
         t.append(" ◆ collaborators ", style="bold reverse")
         t.append(f"  {where}", style="bold")
+        if self.account:
+            t.append(f"   ● {self.account}", style="bold green")
         t.append(f"   {self.summary}", style="dim")
         self.update(t)
 

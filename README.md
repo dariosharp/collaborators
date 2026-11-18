@@ -57,6 +57,7 @@ Then describe what you want, e.g.
 | `Enter` | send your message to the Lead / open the focused agent |
 | `Ctrl+J` or `\` `Enter` | **new line** in your message (also `Shift+Enter` in terminals that report it: kitty, WezTerm, Ghostty, foot, iTerm2) |
 | `/` | **Claude Code slash commands and skills** (yours and the project's), with completion: `↑`/`↓` choose, `Tab` completes — to the Lead, or to one agent from its transcript |
+| `/switch` | **switch Claude account** (or `/switch <name>`): every agent carries on with its conversation — see [Several accounts](#several-accounts) |
 | `/remote-control` | **continue with the Lead from claude.ai/code or the Claude app**; `/remote-control off` stops it (or start with `collab --remote-control`) |
 | `F2` / `F3` | **add a worker / a tester** — the Lead is told immediately and can use it at once |
 | `Delete` | **remove the focused worker or tester** (after a confirmation; a running task is cancelled) |
@@ -68,7 +69,34 @@ Then describe what you want, e.g.
 | `Ctrl+X` | interrupt the focused agent |
 | `Ctrl+P` | command palette (add or remove agents, task board, themes — dark and light) |
 | `F1` | help |
+| `Esc` | **vim normal mode**: `:` commands, `Ctrl+W` windows, `gt`/`gT` tabs — see [Vim mode](#vim-mode) |
 | `Ctrl+C` | clear the input; press twice to quit (`Ctrl+Q` works too) — `collab --resume` brings every conversation back |
+
+## Vim mode
+
+Press `Esc` in the Lead's input for vim's **normal mode** (`-- NORMAL --` at the
+bottom); `i`, `a`, `o` or `Enter` go back to typing. Every other shortcut keeps working.
+
+| Keys | Action |
+|---|---|
+| `:` | command line (`↑`/`↓` history, `Esc` cancels) |
+| `Ctrl+W s` / `Ctrl+W v` | add a worker / a tester ("split") |
+| `Ctrl+W q` | close the selected agent (on the Lead: the tab) |
+| `Ctrl+W w` / `W`, `h` `j` `k` `l` | move between the Lead and the agent cards |
+| `j` / `k`, `Ctrl+D` / `Ctrl+U`, `gg` / `G` | scroll the selected log |
+| `gt` / `gT` | next / previous tab |
+
+| Command | Action |
+|---|---|
+| `:sp`, `:worker [n]` · `:vs`, `:tester [n]` | add workers · testers |
+| `:q` | close the selected agent; on the Lead close the tab, or quit if it is the last |
+| `:rm worker2` | remove an agent |
+| `:qa` | quit collab |
+| `:tabnew [name]`, `:tabc [name]`, `:tabn`, `:tabp` | open, close and switch teams (tabs) |
+| `:e worker1` | full transcript of an agent |
+| `:stop [agent]`, `:tasks`, `:switch [account]`, `:remote [off]`, `:h` | interrupt, task board, account, Remote Control, help |
+
+Add `!` (`:q!`, `:qa!`, `:tabc!`) to skip the confirmation.
 
 ## How it works
 
@@ -166,6 +194,29 @@ collab --remote-control   # reach the Lead from claude.ai/code or your phone too
 > **Permissions:** by default the agents run unattended (`bypassPermissions`) and can
 > edit files and run commands in the project directory. Use it on code you are
 > comfortable letting them change, or run with `--ask`.
+
+## Several accounts
+
+If you have more than one Claude account, collab can run the agents under any of
+them and move between them without losing a conversation — for instance when one
+hits its usage limit.
+
+1. For each extra account, run `claude setup-token` in a terminal, sign in with that
+   account and copy the token it prints.
+2. In collab type `/switch`, press `a`, give the account a name (e.g. `work`) and
+   paste the token. It is kept in `~/.config/collaborators/accounts.json`, readable
+   only by you.
+3. `/switch work` (or `/switch` and Enter) moves every agent of every tab to it.
+   Idle agents switch at once, busy ones when their turn ends; each resumes the
+   same conversation.
+
+`login` is always there: Claude Code's own login. When an account hits its usage
+limit, collab offers to switch to another one (`y`), and tells the Lead which tasks
+stopped so it can pick them up again. The account in use shows in the top bar, is
+remembered for next time, and can be chosen at start with `collab --account work`.
+
+> If `ANTHROPIC_API_KEY` is set in your environment, Claude Code uses it before any
+> account token: unset it to use your accounts.
 
 ## Development
 

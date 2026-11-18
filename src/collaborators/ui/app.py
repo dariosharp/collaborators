@@ -14,17 +14,19 @@ from textual import events
 from textual.app import App, ComposeResult, SystemCommand
 from textual.binding import Binding
 from textual.screen import Screen
-from textual.widgets import Footer, Input, TabbedContent, TabPane
+from textual.widgets import Footer, Input, TabbedContent, TabPane, TextArea
 
+from .. import accounts
 from ..agents import Backend, Command
 from ..config import DEFAULT_TEAM, ConfigError, TeamConfig, check_team_name
-from ..events import Event, TaskRecord
+from ..events import Event, LimitReached, TaskRecord
 from ..orchestrator import Hub, Team
 from ..state import has_saved_team, load_open_teams, save_open_teams
 from .commands import CommandInput
-from .screens import ConfirmScreen, HelpScreen, NameScreen, TaskBoardScreen
+from .screens import AccountScreen, ConfirmScreen, HelpScreen, NameScreen, TaskBoardScreen
 from .team_view import REMOTE_CMD, TeamView
 from .theme import THEMES
+from .vim import ModeLine, VimKeys
 from .widgets import TopBar
 
 __all__ = ["CollabApp", "REMOTE_CMD"]
@@ -60,8 +62,17 @@ class CollabApp(App[None]):
 
     def __init__(self, cfg: TeamConfig, backend: Backend, *, resume: bool = False,
                  initial_prompt: str = "", mode_label: str = "",
-                 remote_control: bool = False) -> None:
+                 remote_control: bool = False, account: str | None = None) -> None:
         super().__init__()
+        # The Claude account every agent runs under (accounts.py); /switch changes it.
+        self.account = account or accounts.current()
+        try:
+            self.account_env = accounts.env_for(self.account)
+        except ConfigError:
+            self.account, self.account_env = accounts.LOGIN, {}
+        self._limit_asked: set[str] = set()  # accounts whose usage limit was reported
+        self.vim = VimKeys(self)  # NORMAL-mode keys (Esc out of the input)
+        self._normal_until = 0.0  # tab switches until then keep NORMAL mode (gt, :tabn)
         self.cfg = cfg
         self.backend = backend
         self.resume = resume
@@ -76,8 +87,9 @@ class CollabApp(App[None]):
 
     # ---- layout -----------------------------------------------------------------
     def compose(self) -> ComposeResult:
-        yield TopBar(self.cfg.workdir, "")
+        yield TopBar(self.cfg.workdir, "", self._account_label())
         yield TabbedContent(id="teams")
+        yield ModeLine()
         yield Footer()
 
     async def on_mount(self) -> None:
@@ -88,6 +100,25 @@ class CollabApp(App[None]):
         for i, name in enumerate(names):
             await self.open_team(name, resume=self.resume, first=i == 0)
         await self._show(names[0])
+        if self.account != accounts.LOGIN and os.environ.get("ANTHROPIC_API_KEY"):
+            self.notify("ANTHROPIC_API_KEY is set: Claude Code uses it before any account "
+                        "token, so /switch has no effect until you unset it.",
+                        title="Accounts", severity="warning", timeout=12)
+
+    @property
+    def mode_line(self) -> ModeLine:
+        return self.query_one(ModeLine)
+
+    def on_key(self, event: events.Key) -> None:
+        """Vim NORMAL mode: keys that reach the app on the main screen while nobody is
+        typing (Esc leaves the Lead's input)."""
+        if not self.screen_stack or self.screen is not self.screen_stack[0]:
+            return
+        if isinstance(self.focused, (Input, TextArea)):
+            return
+        if self.vim.feed(event):
+            event.stop()
+            event.prevent_default()
 
     @property
     def views(self) -> list[TeamView]:
@@ -191,9 +222,18 @@ class CollabApp(App[None]):
         if view is not None:
             view.call_after_refresh(self._focus_if_active, view)
 
+    def keep_normal(self) -> None:
+        """The tab switch about to happen (gt, :tabn) keeps vim's NORMAL mode."""
+        self._normal_until = time.monotonic() + 1.0
+
     def _focus_if_active(self, view: TeamView) -> None:
         if view is self.view:
-            view.focus_input()
+            stay = time.monotonic() < self._normal_until
+            logs = view.query("#lead-log") if stay else None
+            if logs:
+                logs.first().focus()
+            else:
+                view.focus_input()
 
     def _check_new_name(self, name: str) -> str | None:
         try:
@@ -240,7 +280,14 @@ class CollabApp(App[None]):
         nxt = views[(views.index(self.view) + 1) % len(views)]
         self.run_worker(self._show(nxt.team_name), exit_on_error=False)
 
-    def action_close_team(self, name: str) -> None:
+    def action_prev_team(self) -> None:
+        views = self.views
+        if len(views) < 2 or self.view is None:
+            return
+        prv = views[(views.index(self.view) - 1) % len(views)]
+        self.run_worker(self._show(prv.team_name), exit_on_error=False)
+
+    def action_close_team(self, name: str, confirm: bool = True) -> None:
         view = self.view_of(name)
         if view is None:
             return
@@ -256,6 +303,9 @@ class CollabApp(App[None]):
             if yes:
                 self.run_worker(self._close_team(view), exit_on_error=False)
 
+        if not confirm:
+            answer(True)
+            return
         self.push_screen(ConfirmScreen(f"Close team {name}?", detail), callback=answer)
 
     async def _close_team(self, view: TeamView) -> None:
@@ -298,6 +348,79 @@ class CollabApp(App[None]):
         if self.view and not isinstance(self.screen, TaskBoardScreen):
             self.push_screen(TaskBoardScreen(self.view.tasks, self.view))
 
+    # ---- Claude accounts -------------------------------------------------------------
+    def _account_label(self) -> str:
+        if self.account == accounts.LOGIN and accounts.names() == [accounts.LOGIN]:
+            return ""  # only Claude Code's own login: nothing worth showing
+        return self.account
+
+    def action_switch_account(self, name: str | None = None, note: str = "") -> None:
+        """/switch: pick an account (or go straight to `name`); every agent of every
+        team carries on with its conversation under it."""
+        if name is None:
+            def chosen(choice: str | None) -> None:
+                if choice:
+                    self.action_switch_account(choice)
+                else:
+                    self.query_one(TopBar).set_account(self._account_label())
+            self.push_screen(AccountScreen(self.account, note), chosen)
+            return
+        name = name.strip().lower()
+        if name == self.account:
+            self.notify(f"Already on the account {name!r}.")
+            return
+        try:
+            env = accounts.env_for(name)
+        except ConfigError as exc:
+            self.notify(f"{exc}. Type /switch to add it.", title="Accounts",
+                        severity="error")
+            return
+        self.run_worker(self._switch_to(name, env), exit_on_error=False)
+
+    async def _switch_to(self, name: str, env: dict[str, str]) -> None:
+        with contextlib.suppress(ConfigError, OSError):
+            accounts.set_current(name)
+        self.account, self.account_env = name, env
+        self._limit_asked.discard(name)
+        self.query_one(TopBar).set_account(self._account_label())
+        busy = any(v.busy for v in self.views)
+        self.notify(f"Switching to the account {name!r}"
+                    + (": busy agents switch when their turn ends." if busy else "…"),
+                    title="Accounts")
+        await asyncio.gather(*(v.switch_account(name, env) for v in self.views),
+                             return_exceptions=True)
+
+    def limit_reached(self, event: LimitReached) -> None:
+        """An agent hit the account's usage limit: offer another account, once."""
+        account = self.account
+        if account in self._limit_asked:
+            return
+        self._limit_asked.add(account)
+        when = ""
+        if event.resets_at:
+            when = f" (it resets at {time.strftime('%H:%M', time.localtime(event.resets_at))})"
+        self.notify_desktop("collab", f"the Claude account {account} hit its usage limit")
+        others = [n for n in accounts.names() if n != account]
+        if not others:
+            self.notify(f"The Claude account {account!r} hit its usage limit{when}. Add "
+                        "another account with /switch to keep going.", title="Usage limit",
+                        severity="warning", timeout=15)
+            return
+        if len(others) > 1:
+            self.action_switch_account(note=f"{account!r} hit its usage limit{when}. Pick "
+                                            "another account to carry on.")
+            return
+        target = others[0]
+
+        def answer(yes: bool | None) -> None:
+            if yes:
+                self.action_switch_account(target)
+
+        self.push_screen(ConfirmScreen(
+            f"The account {account!r} hit its usage limit{when}. Switch to {target!r}?",
+            "Every agent keeps its conversation; busy ones switch when their turn ends, "
+            "and the Lead is told which tasks to pick up again."), answer)
+
     def action_help(self) -> None:
         self.push_screen(HelpScreen())
 
@@ -328,6 +451,8 @@ class CollabApp(App[None]):
                 yield SystemCommand("Remote Control: " + ("turn off" if on else "turn on"),
                                     "Continue with the Lead from claude.ai/code or the Claude "
                                     "app", lambda: self.set_remote_control(not on))
+        yield SystemCommand("Switch account", f"Run the agents under another Claude account "
+                            f"(now: {self.account})", lambda: self.action_switch_account())
         yield SystemCommand("Task board", "Every task with status, cost and report",
                             self.action_tasks)
 

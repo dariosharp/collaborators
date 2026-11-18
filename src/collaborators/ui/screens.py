@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 from pathlib import Path
 from typing import Any
@@ -12,9 +13,12 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
-from textual.widgets import Button, DataTable, Footer, Input, Static
+from textual.widgets import Button, DataTable, Footer, Input, OptionList, Static
+from textual.widgets.option_list import Option
 
+from .. import accounts
 from ..agents import Decision
+from ..config import ConfigError, check_team_name
 from ..events import Event, TaskRecord, TaskStatus
 from ..orchestrator import fmt_duration
 from .commands import CommandInput, CommandMenu
@@ -319,6 +323,145 @@ class NameScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class TokenScreen(ModalScreen[str | None]):
+    """Paste an account's token (hidden while typed)."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, name: str) -> None:
+        super().__init__()
+        self.account = name
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm", classes="account"):
+            yield Static(Text(f"Token for the account {self.account!r}", style="bold"),
+                         id="confirm-title")
+            yield Static(Text("In another terminal run `claude setup-token`, sign in with "
+                              "that Claude account, and paste the token it prints here. "
+                              "It is kept in ~/.config/collaborators/accounts.json, readable "
+                              "only by you.", style="dim"), id="confirm-detail")
+            yield Input(password=True, placeholder="sk-ant-oat01-…", id="token-input")
+
+    def on_mount(self) -> None:
+        self.query_one(Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        token = event.value.strip()
+        if not token:
+            self.notify("Paste the token first (Esc to cancel).", severity="warning")
+            return
+        self.dismiss(token)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class AccountScreen(ModalScreen[str | None]):
+    """The Claude accounts the agents can run under. Returns the one to switch to."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Close"),
+        Binding("a", "add", "Add account"),
+        Binding("d,delete", "remove", "Remove"),
+    ]
+
+    def __init__(self, current: str, note: str = "") -> None:
+        super().__init__()
+        self.current = current
+        self.note = note
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm", classes="account"):
+            yield Static(Text("Claude account", style="bold"), id="confirm-title")
+            yield Static(Text(self.note or "Every agent keeps its conversation; busy ones "
+                              "switch when their turn ends.", style="dim"),
+                         id="confirm-detail")
+            yield OptionList(id="account-list")
+            yield Static(Text("Enter switch · a add · d remove · Esc close", style="dim"),
+                         id="account-keys")
+
+    def on_mount(self) -> None:
+        self._fill()
+        self.query_one(OptionList).focus()
+
+    def _fill(self, highlight: str | None = None) -> None:
+        names = accounts.names()
+        options = self.query_one(OptionList)
+        options.clear_options()
+        for name in names:
+            line = Text()
+            line.append("● " if name == self.current else "  ",
+                        style="bold green" if name == self.current else "")
+            line.append(name, style="bold")
+            if name == accounts.LOGIN:
+                line.append("  Claude Code's own login", style="dim")
+            options.add_option(Option(line, id=name))
+        target = highlight or self.current
+        options.highlighted = names.index(target) if target in names else 0
+
+    def _selected(self) -> str | None:
+        options = self.query_one(OptionList)
+        if options.highlighted is None:
+            return None
+        return options.get_option_at_index(options.highlighted).id
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        event.stop()
+        self.dismiss(event.option.id)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_add(self) -> None:
+        def check(name: str) -> str | None:
+            try:
+                name = check_team_name(name)
+            except ConfigError as exc:
+                return str(exc)
+            if name in accounts.names():
+                return f"there is already an account called {name!r}"
+            return None
+
+        def got_name(name: str | None) -> None:
+            if name:
+                self.app.push_screen(TokenScreen(name), lambda tok: got_token(name, tok))
+
+        def got_token(name: str, token: str | None) -> None:
+            if not token:
+                return
+            try:
+                accounts.add(name, token)
+            except ConfigError as exc:
+                self.notify(str(exc), severity="error")
+                return
+            self._fill(highlight=name)
+            self.notify(f"Account {name!r} added: press Enter to switch to it.")
+
+        self.app.push_screen(NameScreen("Name for the new account",
+                                        "A short name, e.g. work or personal.", "", check),
+                             got_name)
+
+    def action_remove(self) -> None:
+        name = self._selected()
+        if not name or name == accounts.LOGIN:
+            self.notify("Claude Code's own login cannot be removed.", severity="warning")
+            return
+
+        def answer(yes: bool | None) -> None:
+            if not yes:
+                return
+            with contextlib.suppress(ConfigError):
+                accounts.remove(name)
+            if name == self.current:  # its token is gone: back to the login
+                self.dismiss(accounts.LOGIN)
+            else:
+                self._fill()
+
+        self.app.push_screen(ConfirmScreen(f"Remove the account {name!r}?",
+                                           "Its token is deleted from collab."), answer)
+
+
 HELP = """\
 ## collaborators
 
@@ -338,11 +481,13 @@ work streams live into its card.
 | `Ctrl+X` | interrupt the focused agent (the Lead when typing) |
 | `Ctrl+P` | command palette (add or remove agents, themes, …) |
 | `/` | slash commands and skills (yours and the project's): `↑`/`↓` choose, `Tab` completes |
+| `/switch` | switch Claude account (or `/switch <name>`); conversations carry on |
 | `/remote-control` | continue with the Lead from claude.ai/code or the Claude app (`off` to stop) |
 | `↑` / `↓` | browse your previous messages (from the first / last line of the input) |
 | `Ctrl+N` | open a new team in a new tab (its own Lead, workers and testers) |
 | `Ctrl+G` | go to the next team's tab (or click the tab) |
 | `F1` | this help |
+| `Esc` | vim **normal mode** (see below); `i`, `a`, `o` or `Enter` to type again |
 | `Ctrl+C` | clear the input; press twice to quit (also `Ctrl+Q`) — `collab --resume` picks up |
 
 In an agent's full transcript you can message that agent directly; the Lead is
@@ -351,6 +496,31 @@ not told about those exchanges.
 Teams in different tabs share the directory: a task that would touch files
 another team is working on is refused, and the Leads can write to each other
 (a few messages at a time, shown in both tabs). Close a tab from `Ctrl+P`.
+
+### Vim mode
+
+Press `Esc` in the Lead's input to get to **normal mode** (`-- NORMAL --` at the bottom):
+
+| Keys | Action |
+|---|---|
+| `:` | command line (`↑`/`↓` history, `Esc` cancels) |
+| `Ctrl+W s` / `Ctrl+W v` | add a worker / a tester |
+| `Ctrl+W q` | close the selected agent (on the Lead: the tab) |
+| `Ctrl+W w` / `W`, `h` `j` `k` `l` | move between the Lead and the cards |
+| `j` / `k`, `Ctrl+D` / `Ctrl+U`, `gg` / `G` | scroll the selected log |
+| `gt` / `gT` | next / previous tab |
+
+| Command | Action |
+|---|---|
+| `:sp`, `:worker [n]` · `:vs`, `:tester [n]` | add workers · testers |
+| `:q[!]` | close the selected agent; on the Lead the tab, or quit if it is the last |
+| `:rm[!] worker2` | remove an agent |
+| `:qa[!]` | quit collab |
+| `:tabnew [name]`, `:tabc[!] [name]`, `:tabn`, `:tabp` | tabs (teams) |
+| `:e worker1` | full transcript of an agent |
+| `:stop [agent]`, `:tasks`, `:switch [account]`, `:remote [off]`, `:h` | as the keys above |
+
+`!` skips the confirmation.
 """
 
 

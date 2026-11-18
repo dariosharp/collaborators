@@ -19,6 +19,7 @@ from ..events import (
     AgentRemoved,
     AgentStatus,
     Event,
+    LimitReached,
     Notice,
     StatusChanged,
     TaskRecord,
@@ -36,6 +37,8 @@ HISTORY_LIMIT = 3000
 NOTIFY_AFTER_S = 30.0
 REMOTE_CMD = Command("remote-control", "Control the Lead from claude.ai/code or the Claude "
                      "app (collab)", "[off]")
+SWITCH_CMD = Command("switch", "Switch Claude account; every conversation carries on "
+                     "(collab)", "[account]")
 MODEL_SET = re.compile(r"Set model to `([^`]+)`")
 
 
@@ -77,7 +80,9 @@ class TeamView(Vertical):
 
     def on_mount(self) -> None:
         self.team = Team(self.cfg, self.backend, self.on_team_event, resume=self.resume,
-                         approver=self.approve, hub=self.hub)
+                         approver=self.approve, hub=self.hub,
+                         account=getattr(self.app, "account", "login"),
+                         env=getattr(self.app, "account_env", {}))
         for name in self.team.agent_names[1:]:
             self._mount_card(name)
         self.set_interval(0.1, self._tick)
@@ -175,6 +180,10 @@ class TeamView(Vertical):
                 self._notify_done(event)
         if isinstance(event, TextDone):
             self._follow_model_switch(event)
+        if isinstance(event, LimitReached):
+            limit = getattr(self.app, "limit_reached", None)
+            if limit is not None:
+                limit(event)
 
         target: Any = self.query_one(LeadPanel) if event.agent == LEAD else \
             self._card(event.agent)
@@ -262,7 +271,10 @@ class TeamView(Vertical):
         if runner is None:
             return []
         extra = [REMOTE_CMD] if agent == LEAD and self.team.remote_control_available else []
-        return extra + [c for c in runner.commands if c.name != REMOTE_CMD.name]
+        if agent == LEAD:
+            extra.append(SWITCH_CMD)
+        ours = {c.name for c in extra}
+        return extra + [c for c in runner.commands if c.name not in ours]
 
     @property
     def remote_url(self) -> str | None:
@@ -293,6 +305,14 @@ class TeamView(Vertical):
 
         self.run_worker(switch(), exit_on_error=False)
 
+    async def switch_account(self, account: str, env: dict[str, str]) -> None:
+        if self.team is None:
+            return
+        await self.team.switch_account(account, env)
+        lead = self.query_one(LeadPanel)
+        lead.remote_url = getattr(self.team.runners[LEAD].session, "remote_url", None)
+        lead._render_header()
+
     def on_lead_panel_submitted(self, message: LeadPanel.Submitted) -> None:
         message.stop()
         if self.team is None:
@@ -303,6 +323,8 @@ class TeamView(Vertical):
             parts = message.text[1:].split()
             if parts and parts[0] == REMOTE_CMD.name and self.team.remote_control_available:
                 self.set_remote_control(not (len(parts) > 1 and parts[1] == "off"))
+            elif parts and parts[0] == SWITCH_CMD.name:
+                self.app.action_switch_account(parts[1] if len(parts) > 1 else None)
             elif self.check_command(LEAD, message.text):
                 self.team.tell_lead(message.text, chat=False)
             return
@@ -382,10 +404,13 @@ class TeamView(Vertical):
 
         self.run_worker(add(), exit_on_error=False)
 
-    def remove_agent(self, name: str | None = None) -> None:
+    def remove_agent(self, name: str | None = None, confirm: bool = True) -> None:
         if self.team is None:
             return
         name = name or self.focused_agent()
+        if name and self.team is not None and name != LEAD:
+            with contextlib.suppress(ValueError):
+                name = self.team.resolve_agent(name)
         if name == LEAD or name not in self.team.runners:
             self.notify("Focus a worker or tester card (Tab) to remove it.", severity="warning")
             return
@@ -408,6 +433,9 @@ class TeamView(Vertical):
             self.notify(f"{self._who(name)} left the team — the Lead has been told.",
                         title="Team")
 
+        if not confirm:
+            answer(True)
+            return
         self.app.push_screen(ConfirmScreen(f"Remove {self._who(name)} from the team?", detail),
                              callback=answer)
 

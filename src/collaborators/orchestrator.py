@@ -95,6 +95,8 @@ class Team:
         resume: bool = False,
         approver: Approver | None = None,
         hub: Hub | None = None,
+        account: str = "login",
+        env: dict[str, str] | None = None,
     ) -> None:
         self.cfg = cfg
         self.name = cfg.team
@@ -126,6 +128,9 @@ class Team:
 
         self._backend = backend
         self._approver = approver
+        self.account = account
+        self.env = dict(env or {})  # the Claude account's environment (accounts.py)
+        self._limit_reported: set[str] = set()  # limited tasks the Lead was told about
         self._announcements: list[str] = []  # news the Lead hasn't seen yet
         self._news = asyncio.Event()           # wakes a blocked wait_tasks early
         self._lead_waits = 0                   # wait_tasks calls the Lead is blocked in
@@ -157,6 +162,7 @@ class Team:
             tools=self._lead_tools() if role == "lead" else [],
             approver=self._approver if self.cfg.ask else None,
             team=self.name,
+            env=dict(self.env),
         )
         runner = AgentRunner(spec, self._backend(spec), self._on_event)
         self.runners[name] = runner
@@ -243,6 +249,44 @@ class Team:
         if self.name != "main":
             name += f" · {self.name}"
         return await session.set_remote_control(enabled, name if enabled else None)
+
+    async def switch_account(self, account: str, env: dict[str, str]) -> None:
+        """Run every agent under another Claude account, keeping its conversation.
+        Idle agents switch now, busy ones when their turn ends. If work stopped at
+        the old account's usage limit, the Lead is told so that it carries on."""
+        self.account, self.env = account, dict(env)
+        lead = self.runners[LEAD]
+        remote = bool(getattr(lead.session, "remote_url", None))
+        lead_limited = lead.last_limited
+        runners = list(self.runners.values())
+        results = await asyncio.gather(
+            *(r.reconnect(self._backend, env=dict(env)) for r in runners),
+            return_exceptions=True)
+        for runner, res in zip(runners, results, strict=True):
+            if isinstance(res, BaseException):
+                self._ui_emit(Notice(LEAD, f"{runner.name} could not switch to {account}: "
+                                           f"{res}", "error"))
+        self._save_sessions()
+        if remote:
+            with contextlib.suppress(Exception):
+                await self.set_remote_control(True)
+        stopped = [t for t in self.tasks.values()
+                   if t.limited and t.id not in self._limit_reported]
+        self._limit_reported.update(t.id for t in stopped)
+        lines = []
+        if stopped:
+            lines.append("These tasks stopped at the old account's usage limit: "
+                         + ", ".join(f"{t.id} ({t.agent})" for t in stopped)
+                         + ". Dispatch them again to the same agents: each keeps its "
+                         "conversation, so ask it to continue where it stopped.")
+        if lead_limited:
+            lines.append("Your own last turn was cut off by the limit: carry on from where "
+                         "you stopped.")
+        if lines:
+            self._announce(f"The user switched the team to the Claude account {account!r}. "
+                           + " ".join(lines))
+        else:
+            self._ui_emit(Notice(LEAD, f"Now running on the Claude account {account!r}."))
 
     def _announce(self, text: str) -> None:
         """Make sure the Lead learns `text`: in its next team-tool result if it is
@@ -468,6 +512,7 @@ class Team:
             task.result = result.text
             task.cost_usd = result.cost_usd
             task.num_turns = result.num_turns
+            task.limited = result.limited
             if task.status is not TaskStatus.CANCELLED:
                 task.status = TaskStatus.FAILED if result.is_error else TaskStatus.DONE
         except asyncio.CancelledError:
