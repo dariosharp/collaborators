@@ -14,7 +14,7 @@ def test_defaults(tmp_path):
     assert cfg.agent_names == ["lead", "worker1", "tester1"]
     assert cfg.role_config("lead") == RoleConfig("claude-fable-5-2", "medium")
     assert cfg.role_config("worker1") == RoleConfig("claude-opus-5-5", "medium")
-    assert cfg.role_config("tester1") == RoleConfig("claude-opus-4-8", "medium")
+    assert cfg.role_config("tester1") == RoleConfig("claude-sonnet-5-5", "medium")
     assert cfg.permission_mode == "bypassPermissions"
 
 

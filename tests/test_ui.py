@@ -374,3 +374,114 @@ async def test_switch_account_and_limit_prompt(tmp_path, monkeypatch):
         await pilot.press("escape", "enter")
         await wait_for(pilot, lambda: type(app.screen).__name__ == "AccountScreen")
         await pilot.press("escape")
+
+        # /switch add goes straight to naming a new account; then its token.
+        inp.focus()
+        inp.value = "/switch add"
+        await pilot.press("enter")
+        await wait_for(pilot, lambda: type(app.screen).__name__ == "NameScreen")
+        await pilot.press(*"personal", "enter")
+        # A claude.ai login (first) or a setup-token: pick the token.
+        await wait_for(pilot, lambda: type(app.screen).__name__ == "AccountKindScreen")
+        await pilot.press("down", "enter")
+        await wait_for(pilot, lambda: type(app.screen).__name__ == "TokenScreen")
+        await pilot.press(*"tok-2", "enter")
+        await wait_for(pilot, lambda: "personal" in accounts.names())
+        assert accounts.env_for("personal") == {"CLAUDE_CODE_OAUTH_TOKEN": "tok-2"}
+
+
+def test_hint_options():
+    from collaborators.ui.commands import hint_options
+
+    assert [v for v, _ in hint_options("[low|medium|high|xhigh|max] [--fix] [<pr#>]")] == \
+        ["low", "medium", "high", "xhigh", "max"]
+    assert [v for v, _ in hint_options("<low|max|ultracode [on|off]>")] == ["low", "max",
+                                                                          "ultracode"]
+    assert [v for v, _ in hint_options("[auto|<tokens>]")] == ["auto"]
+    assert hint_options("[model]") == [] and hint_options("<instructions>") == []
+    assert hint_options("") == []
+
+
+async def test_argument_completion(tmp_path, monkeypatch):
+    from collaborators import accounts
+    from collaborators.ui.commands import CommandInput, CommandMenu
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    accounts.add("work", "tok")
+    cfg = load_config(tmp_path / ".", {"workers": 1, "testers": 0})
+    app = CollabApp(cfg, fake_backend(speed=20))
+    async with app.run_test(size=(140, 40)) as pilot:
+        await wait_for(pilot, lambda: app.team and app.team._lead_loop is not None
+                       and app.commands_for("lead"))
+        inp = app.query_one("#lead-input", CommandInput)
+        menu = app.query_one("#lead-input-menu", CommandMenu)
+        inp.focus()
+
+        def shown():
+            return [v for v, _ in menu.values] if menu.display and menu.arg_of else []
+
+        # Completing a command that takes values lists them at once.
+        inp.value = "/mod"
+        await pilot.press("tab")
+        assert inp.value == "/model "
+        assert shown() == ["default", "opus", "fable", "sonnet", "haiku"]
+        await pilot.press(*"so")
+        assert shown() == ["sonnet"]
+        await pilot.press("enter")  # picks it and sends
+        await wait_for(pilot, lambda: "/model sonnet" in app.backend.sessions["lead"].prompts)
+        assert inp.value == ""
+
+        # /switch lists the accounts (the one in use last); values from a hint too.
+        inp.value = "/switch "
+        assert shown() == ["work", "login", "add"]
+        inp.value = "/effort h"
+        assert shown() == ["high", "xhigh"]
+        await pilot.press("down", "tab")
+        assert inp.value == "/effort xhigh" and not menu.display
+        # Free text after the value, or a command without values: no menu.
+        inp.value = "/compact keep the API notes"
+        assert not menu.display
+        inp.value = "/switch work"
+        assert not menu.display  # typed in full
+
+
+async def test_switch_add_with_claude_ai_login(tmp_path, monkeypatch):
+    """`/switch add` → a name → claude.ai login. Headless, collab cannot step aside for
+    `claude auth login`, so it shows the command; y then checks it and adds the account."""
+    from collaborators import accounts
+    from collaborators.ui.commands import CommandInput
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    accounts.add("personal", "tok")  # a token account, turned into a login one
+    monkeypatch.setattr(accounts, "login_status", lambda path: {
+        "loggedIn": True, "authMethod": "claude.ai", "email": "p@example.com"})
+    cfg = load_config(tmp_path / ".", {"workers": 1, "testers": 0})
+    app = CollabApp(cfg, fake_backend(speed=20))
+    async with app.run_test(size=(140, 40)) as pilot:
+        await wait_for(pilot, lambda: app.team and app.team._lead_loop is not None)
+        inp = app.query_one("#lead-input", CommandInput)
+        inp.focus()
+        inp.value = "/switch add"
+        await pilot.press("enter")
+        await wait_for(pilot, lambda: type(app.screen).__name__ == "NameScreen")
+        await pilot.press(*"personal", "enter")
+        await wait_for(pilot, lambda: type(app.screen).__name__ == "AccountKindScreen")
+        await pilot.press("enter")  # log in with claude.ai
+        await wait_for(pilot, lambda: isinstance(app.screen, ConfirmScreen))
+        path = accounts.login_dir("personal")
+        assert accounts.login_hint(path) in app.screen.detail
+        assert (path / "projects").is_symlink()
+        (path / ".credentials.json").write_text("{}")  # as `claude auth login` would
+        await pilot.press("y")
+        await wait_for(pilot, lambda: accounts.kind("personal") == "claude.ai")
+        assert accounts.supports_remote_control("personal")
+        await pilot.press("escape")
+        inp.focus()
+        inp.value = "/switch personal"
+        await pilot.press("enter")
+        await wait_for(pilot, lambda: app.backend.sessions["lead"].spec.env
+                       == {"CLAUDE_CONFIG_DIR": str(path)})
+        assert app.team.account == "personal"

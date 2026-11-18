@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -17,6 +18,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="collab",
         description="A Lead, Workers and Testers made of Claude agents, live in your terminal.",
+        epilog="Accounts: `collab account login NAME` adds one with its own claude.ai "
+               "login; `collab account list` shows them.",
     )
     p.add_argument("-d", "--dir", type=Path, default=None,
                    help="project directory the agents work in (default: current directory)")
@@ -40,7 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--remote-control", action="store_true",
                    help="make the Lead controllable from claude.ai/code and the Claude app")
     p.add_argument("--account", default=None, metavar="NAME",
-                   help="Claude account to run the agents under (see /switch; "
+                   help="Claude account to run the agents under (see /switch and `collab account`; "
                         "default: the last one used)")
     p.add_argument("--demo", action="store_true",
                    help="scripted demo: no API calls, no cost, runs in a temp directory")
@@ -48,7 +51,53 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def account_main(argv: list[str]) -> int:
+    """`collab account …`: manage the Claude accounts outside the UI."""
+    p = argparse.ArgumentParser(prog="collab account",
+                                description="Claude accounts the agents can run under.")
+    sub = p.add_subparsers(dest="command", required=True)
+    sub.add_parser("list", help="list the accounts and how each signs in")
+    login = sub.add_parser("login", help="add (or re-add) an account with its own claude.ai "
+                                         "login, which supports Remote Control")
+    login.add_argument("name", help="the account's name, e.g. personal")
+    args = p.parse_args(argv)
+
+    if args.command == "list":
+        current = accounts.current()
+        for name in accounts.names():
+            how = accounts.kind(name)
+            if how == "claude.ai" and not accounts.is_logged_in(accounts.login_dir(name)):
+                how += " (logged out)"
+            print(f"{'*' if name == current else ' '} {name:<16} {how}")
+        return 0
+
+    try:
+        name = accounts.check_new_name(args.name.strip().lower())
+        path = accounts.prepare_login_dir(accounts.login_dir(name))
+    except (ConfigError, OSError) as exc:
+        print(f"collab: {exc}", file=sys.stderr)
+        return 2
+    print(f"Logging the account {name!r} in with claude.ai (config dir {path}).")
+    try:
+        subprocess.run(accounts.login_command(), env=accounts.claude_env(path), check=False)
+    except OSError as exc:
+        print(f"collab: cannot run claude ({exc}); run `{accounts.login_hint(path)}` "
+              f"yourself, then `collab account login {name}` again", file=sys.stderr)
+        return 1
+    try:
+        who = accounts.check_login(name)
+    except ConfigError as exc:
+        print(f"collab: {exc}", file=sys.stderr)
+        return 1
+    print(f"Account {name!r} added ({who}). Use it with `/switch {name}` in collab, "
+          f"or `collab --account {name}`.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["account"]:
+        return account_main(argv[1:])
     args = build_parser().parse_args(argv)
 
     workdir = args.dir or Path.cwd()

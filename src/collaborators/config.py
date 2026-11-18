@@ -15,7 +15,7 @@ PERMISSION_MODES = ("bypassPermissions", "acceptEdits", "default", "auto")
 ROLE_DEFAULTS: dict[str, tuple[str, str]] = {
     "lead": ("claude-fable-5-2", "medium"),
     "worker": ("claude-opus-5-5", "medium"),
-    "tester": ("claude-opus-4-8", "medium"),
+    "tester": ("claude-sonnet-5-5", "medium"),
 }
 
 

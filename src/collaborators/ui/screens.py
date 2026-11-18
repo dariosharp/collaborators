@@ -24,6 +24,22 @@ from ..orchestrator import fmt_duration
 from .commands import CommandInput, CommandMenu
 from .widgets import Transcript, short_model
 
+LOGIN_KIND, TOKEN_KIND = "claude.ai", "token"  # what accounts.kind() returns
+
+
+def describe_account(name: str) -> str:
+    """How an account signs in, for the account lists."""
+    try:
+        how = accounts.kind(name)
+    except ConfigError:
+        return ""
+    if how == accounts.LOGIN:
+        return "Claude Code's own login"
+    if how == LOGIN_KIND:
+        return "claude.ai login" if accounts.is_logged_in(accounts.login_dir(name)) \
+            else "claude.ai login (logged out: re-add it)"
+    return "setup-token (no Remote Control)"
+
 
 class AgentDetailScreen(Screen[None]):
     """Full transcript of one agent, with diffs and command output, and a direct line."""
@@ -357,6 +373,39 @@ class TokenScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class AccountKindScreen(ModalScreen[str | None]):
+    """How a new account signs in: a claude.ai login or a setup-token."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, name: str) -> None:
+        super().__init__()
+        self.account = name
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm", classes="account"):
+            yield Static(Text(f"How should {self.account!r} sign in?", style="bold"),
+                         id="confirm-title")
+            yield Static(Text("A claude.ai login gets its own Claude Code config dir; "
+                              "conversations, settings and skills stay shared.",
+                              style="dim"), id="confirm-detail")
+            yield OptionList(
+                Option("log in with claude.ai (supports Remote Control)", id=LOGIN_KIND),
+                Option("paste a token from `claude setup-token` (no Remote Control)",
+                       id=TOKEN_KIND),
+                id="account-list")
+
+    def on_mount(self) -> None:
+        self.query_one(OptionList).focus()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        event.stop()
+        self.dismiss(event.option.id)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class AccountScreen(ModalScreen[str | None]):
     """The Claude accounts the agents can run under. Returns the one to switch to."""
 
@@ -366,10 +415,11 @@ class AccountScreen(ModalScreen[str | None]):
         Binding("d,delete", "remove", "Remove"),
     ]
 
-    def __init__(self, current: str, note: str = "") -> None:
+    def __init__(self, current: str, note: str = "", adding: bool = False) -> None:
         super().__init__()
         self.current = current
         self.note = note
+        self.adding = adding  # open straight on "add an account" (`/switch add`)
 
     def compose(self) -> ComposeResult:
         with Vertical(id="confirm", classes="account"):
@@ -384,6 +434,8 @@ class AccountScreen(ModalScreen[str | None]):
     def on_mount(self) -> None:
         self._fill()
         self.query_one(OptionList).focus()
+        if self.adding or accounts.names() == [accounts.LOGIN]:
+            self.call_after_refresh(self.action_add)  # nothing to switch to yet
 
     def _fill(self, highlight: str | None = None) -> None:
         names = accounts.names()
@@ -394,8 +446,7 @@ class AccountScreen(ModalScreen[str | None]):
             line.append("● " if name == self.current else "  ",
                         style="bold green" if name == self.current else "")
             line.append(name, style="bold")
-            if name == accounts.LOGIN:
-                line.append("  Claude Code's own login", style="dim")
+            line.append(f"  {describe_account(name)}", style="dim")
             options.add_option(Option(line, id=name))
         target = highlight or self.current
         options.highlighted = names.index(target) if target in names else 0
@@ -419,13 +470,26 @@ class AccountScreen(ModalScreen[str | None]):
                 name = check_team_name(name)
             except ConfigError as exc:
                 return str(exc)
-            if name in accounts.names():
-                return f"there is already an account called {name!r}"
-            return None
+            if name == accounts.LOGIN:
+                return f"{accounts.LOGIN!r} is Claude Code's own login; pick another name"
+            if name == accounts.ADD:
+                return f"{accounts.ADD!r} is reserved; pick another name"
+            return None  # an existing name is re-added (e.g. a token turned into a login)
 
         def got_name(name: str | None) -> None:
             if name:
+                self.app.push_screen(AccountKindScreen(name), lambda k: got_kind(name, k))
+
+        def got_kind(name: str, how: str | None) -> None:
+            if how == TOKEN_KIND:
                 self.app.push_screen(TokenScreen(name), lambda tok: got_token(name, tok))
+            elif how == LOGIN_KIND:
+                self.app.login_account(name, added)  # type: ignore[attr-defined]
+
+        def added(name: str) -> None:
+            self._fill(highlight=name)
+            self.notify(f"Account {name!r} added: press Enter to switch to it, or later "
+                        f"type /switch {name}.")
 
         def got_token(name: str, token: str | None) -> None:
             if not token:
@@ -435,11 +499,12 @@ class AccountScreen(ModalScreen[str | None]):
             except ConfigError as exc:
                 self.notify(str(exc), severity="error")
                 return
-            self._fill(highlight=name)
-            self.notify(f"Account {name!r} added: press Enter to switch to it.")
+            added(name)
+            self.app.account_updated(name)  # type: ignore[attr-defined]
 
         self.app.push_screen(NameScreen("Name for the new account",
-                                        "A short name, e.g. work or personal.", "", check),
+                                        "A short name, e.g. work or personal. Re-adding an "
+                                        "existing one replaces how it signs in.", "", check),
                              got_name)
 
     def action_remove(self) -> None:
@@ -459,7 +524,8 @@ class AccountScreen(ModalScreen[str | None]):
                 self._fill()
 
         self.app.push_screen(ConfirmScreen(f"Remove the account {name!r}?",
-                                           "Its token is deleted from collab."), answer)
+                                           "Its token or claude.ai login is deleted from collab; "
+                                           "conversations stay."), answer)
 
 
 HELP = """\
@@ -481,8 +547,10 @@ work streams live into its card.
 | `Ctrl+X` | interrupt the focused agent (the Lead when typing) |
 | `Ctrl+P` | command palette (add or remove agents, themes, …) |
 | `/` | slash commands and skills (yours and the project's): `↑`/`↓` choose, `Tab` completes |
+| `/command ` | its values: `/switch` accounts, `/model` models… (`Enter` picks, sends) |
 | `/switch` | switch Claude account (or `/switch <name>`); conversations carry on |
-| `/remote-control` | continue with the Lead from claude.ai/code or the Claude app (`off` to stop) |
+| `/switch add` | add an account: claude.ai login (Remote Control works) or a token |
+| `/remote-control` | reach the Lead from claude.ai/code or the Claude app; not on token accounts |
 | `↑` / `↓` | browse your previous messages (from the first / last line of the input) |
 | `Ctrl+N` | open a new team in a new tab (its own Lead, workers and testers) |
 | `Ctrl+G` | go to the next team's tab (or click the tab) |

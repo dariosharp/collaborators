@@ -10,6 +10,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from . import accounts
 from .agents import AgentRunner, AgentSpec, Approver, Backend, Emit, ToolSpec
 from .config import TeamConfig
 from .events import (
@@ -36,6 +37,11 @@ MAX_AGENTS = 16
 # Lead-to-Lead messages a Lead may send before the user talks to it again:
 # enough to agree on an API, not enough for two models to chat away the quota.
 PEER_MESSAGE_BUDGET = 4
+# Remote Control goes through claude.ai, which needs a claude.ai login: a
+# `claude setup-token` token is inference-only, and the CLI rejects it.
+REMOTE_NEEDS_LOGIN = (f"Remote Control needs a claude.ai login: accounts added with a "
+                      f"setup-token can't use it; switch to `{accounts.LOGIN}` or re-add "
+                      f"the account with claude.ai login (/switch {accounts.ADD}).")
 
 
 def fmt_duration(seconds: float) -> str:
@@ -95,7 +101,7 @@ class Team:
         resume: bool = False,
         approver: Approver | None = None,
         hub: Hub | None = None,
-        account: str = "login",
+        account: str = accounts.LOGIN,
         env: dict[str, str] | None = None,
     ) -> None:
         self.cfg = cfg
@@ -245,10 +251,17 @@ class Team:
         session: Any = self.runners[LEAD].session
         if not hasattr(session, "set_remote_control"):
             raise ValueError("this backend has no Remote Control")
+        if enabled and not accounts.supports_remote_control(self.account):
+            raise ValueError(REMOTE_NEEDS_LOGIN)
         name = f"collab · {self.cfg.workdir.name}"
         if self.name != "main":
             name += f" · {self.name}"
-        return await session.set_remote_control(enabled, name if enabled else None)
+        try:
+            return await session.set_remote_control(enabled, name if enabled else None)
+        except Exception as exc:
+            if "login was rejected" in str(exc):
+                raise ValueError(REMOTE_NEEDS_LOGIN) from exc
+            raise
 
     async def switch_account(self, account: str, env: dict[str, str]) -> None:
         """Run every agent under another Claude account, keeping its conversation.
@@ -268,8 +281,18 @@ class Team:
                                            f"{res}", "error"))
         self._save_sessions()
         if remote:
-            with contextlib.suppress(Exception):
+            try:
                 await self.set_remote_control(True)
+            except Exception as exc:
+                # The new session starts without it; make sure the header agrees.
+                session: Any = lead.session
+                session.remote_url = None
+                why = (f"the account {account!r} is a setup-token, which can't use it. "
+                       f"Switch to {accounts.LOGIN!r}, or re-add {account!r} with claude.ai "
+                       f"login (/switch {accounts.ADD}), to use it"
+                       if str(exc) == REMOTE_NEEDS_LOGIN else str(exc).rstrip("."))
+                self._ui_emit(Notice(LEAD, f"Remote Control was turned off: {why}.",
+                                     "warning"))
         stopped = [t for t in self.tasks.values()
                    if t.limited and t.id not in self._limit_reported]
         self._limit_reported.update(t.id for t in stopped)

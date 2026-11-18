@@ -72,6 +72,9 @@ class Command:
     name: str
     description: str = ""
     hint: str = ""
+    # Values its first argument can take, as (value, description), for completion.
+    # Empty: guessed from the hint when it lists them, e.g. "[low|medium|high]".
+    options: tuple[tuple[str, str], ...] = ()
 
 
 class AgentSession(Protocol):
@@ -132,6 +135,11 @@ class AgentRunner:
     @property
     def commands(self) -> list[Command]:
         return list(getattr(self.session, "commands", None) or [])
+
+    @property
+    def models(self) -> list[tuple[str, str]]:
+        """The models its session offers for /model, as (value, description)."""
+        return list(getattr(self.session, "models", None) or [])
 
     @property
     def busy(self) -> bool:

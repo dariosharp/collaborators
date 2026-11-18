@@ -89,6 +89,7 @@ class SdkSession:
         self._cost_so_far = 0.0  # ResultMessage cost is cumulative per client
         self._always_allowed: set[str] = set()
         self.commands: list[Command] = []
+        self.models: list[tuple[str, str]] = []  # for /model completion
         self.remote_control_available = False
         self.remote_url: str | None = None
         self.on_remote: Callable[[Event], None] | None = None  # events of claude.ai turns
@@ -160,6 +161,12 @@ class SdkSession:
                     str(c.get("argumentHint", "") or ""))
             for c in info.get("commands", []) or []
             if isinstance(c, dict) and c.get("name") and not str(c["name"]).startswith("_")
+        ]
+        self.models = [
+            (str(m["value"]), " · ".join(str(m[k]) for k in ("displayName", "description")
+                                         if m.get(k)))
+            for m in info.get("models", []) or []
+            if isinstance(m, dict) and m.get("value")
         ]
         self.remote_control_available = bool(info.get("remote_control_available"))
         # Read the session's output all the time, not only during our own turns: with

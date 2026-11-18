@@ -629,3 +629,85 @@ async def test_busy_agent_switches_after_its_turn_and_lead_hears_of_limits(tmp_p
     await settle(team)
     assert not [p for p in sessions["lead"].prompts if "usage limit" in p]
     await team.shutdown()
+
+
+def token_account_work(tmp_path, monkeypatch) -> None:
+    """`work`, a setup-token account, in a config dir of the test's own."""
+    from collaborators import accounts
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    accounts.add("work", "tok")
+    assert not accounts.supports_remote_control("work")
+
+
+async def test_remote_control_under_a_token_account_fails_fast(tmp_path, monkeypatch):
+    from collaborators.orchestrator import REMOTE_NEEDS_LOGIN
+    token_account_work(tmp_path, monkeypatch)
+    team, events, sessions = make_team(tmp_path, workers=1, testers=0, account="work",
+                                       env={"CLAUDE_CODE_OAUTH_TOKEN": "tok"})
+    await team.start()
+    with pytest.raises(ValueError, match="setup-token") as err:
+        await team.set_remote_control(True)
+    assert str(err.value) == REMOTE_NEEDS_LOGIN
+    assert sessions["lead"].remote_requests == []   # nothing sent to the CLI
+    assert sessions["lead"].remote_url is None
+    await team.shutdown()
+
+
+async def test_cli_login_rejection_is_explained(tmp_path):
+    from collaborators.orchestrator import REMOTE_NEEDS_LOGIN
+    team, events, sessions = make_team(tmp_path, workers=1, testers=0)
+    await team.start()
+
+    async def rejected(enabled, name=None):
+        raise Exception("Claude.ai login was rejected — run /login, then /remote-control")
+
+    sessions["lead"].set_remote_control = rejected
+    with pytest.raises(ValueError) as err:
+        await team.set_remote_control(True)
+    assert str(err.value) == REMOTE_NEEDS_LOGIN
+    await team.shutdown()
+
+
+async def test_switching_to_a_token_account_turns_remote_control_off(tmp_path, monkeypatch):
+    token_account_work(tmp_path, monkeypatch)
+    team, events, sessions = make_team(tmp_path, workers=1, testers=0)
+    await team.start()
+    assert await team.set_remote_control(True)
+    old_lead = sessions["lead"]
+    await team.switch_account("work", {"CLAUDE_CODE_OAUTH_TOKEN": "tok"})
+    lead = team.runners["lead"].session
+    assert lead is not old_lead and lead.remote_url is None
+    assert lead.remote_requests == []   # not even tried under the token
+    notices = [e for e in events if isinstance(e, Notice) and "Remote Control" in e.text]
+    assert len(notices) == 1 and notices[0].level == "warning"
+    assert "turned off" in notices[0].text and "'work'" in notices[0].text
+    assert "/switch add" in notices[0].text
+    # Back on login it can be turned on again.
+    await team.switch_account("login", {})
+    assert await team.set_remote_control(True)
+    await team.shutdown()
+
+
+async def test_remote_control_works_on_a_claude_ai_login_account(tmp_path, monkeypatch):
+    from collaborators import accounts
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    path = accounts.prepare_login_dir(accounts.login_dir("personal"))
+    (path / ".credentials.json").write_text("{}")
+    accounts.add_login("personal")
+    accounts.add("work", "tok")
+    team, events, sessions = make_team(tmp_path / "proj", workers=1, testers=0)
+    await team.start()
+    assert await team.set_remote_control(True)
+    # login -> claude.ai login account: Remote Control comes back on by itself.
+    await team.switch_account("personal", accounts.env_for("personal"))
+    lead = team.runners["lead"].session
+    assert lead.spec.env == {"CLAUDE_CONFIG_DIR": str(path)}
+    assert lead.remote_requests == [True] and lead.remote_url
+    # …and to a setup-token account it goes off, with a notice.
+    await team.switch_account("work", accounts.env_for("work"))
+    assert team.runners["lead"].session.remote_url is None
+    assert any(isinstance(e, Notice) and "turned off" in e.text for e in events)
+    await team.shutdown()

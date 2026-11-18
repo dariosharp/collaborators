@@ -3,6 +3,7 @@ and skills."""
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 
 from rich.text import Text
@@ -24,16 +25,48 @@ def matching(commands: list[Command], typed: str) -> list[Command]:
     return first + rest
 
 
+WORD = re.compile(r"[A-Za-z0-9][\w.-]*")
+
+
+def hint_options(hint: str) -> list[tuple[str, str]]:
+    """The values a command's first argument takes, when its hint lists them:
+    "[low|medium|high] [--fix]" -> low, medium, high. Placeholders such as
+    "<tokens>" are not values and are left out."""
+    m = re.match(r"\s*[\[<]([^\]>]*)", hint or "")
+    if not m:
+        return []
+    inner = re.split(r"[\[<]", m.group(1))[0]
+    if "|" not in inner:
+        return []
+    words = [w.strip() for w in inner.split("|")]
+    return [(w, "") for w in words if WORD.fullmatch(w)]
+
+
+def arg_options(cmd: Command) -> list[tuple[str, str]]:
+    return list(cmd.options) or hint_options(cmd.hint)
+
+
+def matching_options(options: list[tuple[str, str]], typed: str) -> list[tuple[str, str]]:
+    typed = typed.lower()
+    first = [o for o in options if o[0].lower().startswith(typed)]
+    rest = [o for o in options if typed in o[0].lower() and o not in first]
+    return first + rest
+
+
 class CommandMenu(OptionList):
-    """The popup list shown above a CommandInput while a `/command` is being typed."""
+    """The popup list shown above a CommandInput while a `/command` is being typed:
+    the commands, or, after `/command `, the values its argument can take."""
 
     can_focus = False
 
     def __init__(self, *, id: str) -> None:
         super().__init__(id=id, classes="command-menu")
         self.commands: list[Command] = []
+        self.arg_of: str | None = None  # the command whose arguments are listed
+        self.values: list[tuple[str, str]] = []  # (value, description) of arg_of
 
     def show(self, commands: list[Command]) -> None:
+        self.arg_of, self.values = None, []
         self.commands = commands[:MAX_SHOWN]
         self.clear_options()
         for c in self.commands:
@@ -46,6 +79,24 @@ class CommandMenu(OptionList):
             self.add_option(Option(line))
         self.highlighted = 0 if self.commands else None
         self.display = bool(self.commands)
+
+    def show_args(self, command: str, options: list[tuple[str, str]]) -> None:
+        self.commands = []
+        self.arg_of, self.values = command, options[:MAX_SHOWN]
+        self.clear_options()
+        for value, description in self.values:
+            line = Text(no_wrap=True, overflow="ellipsis")
+            line.append(f"/{command} ", style="dim")
+            line.append(value, style="bold")
+            if description:
+                line.append(f"  {description}", style="dim italic")
+            self.add_option(Option(line))
+        self.highlighted = 0 if self.values else None
+        self.display = bool(self.values)
+
+    @property
+    def count(self) -> int:
+        return len(self.values) if self.arg_of else len(self.commands)
 
     def hide(self) -> None:
         self.display = False
@@ -62,6 +113,18 @@ class CommandMenu(OptionList):
         if not self.display or self.highlighted is None or not self.commands:
             return None
         return self.commands[self.highlighted]
+
+    @property
+    def completion(self) -> str | None:
+        """What the input becomes when the highlighted entry is picked."""
+        if not self.display or self.highlighted is None:
+            return None
+        if self.arg_of:
+            if self.highlighted >= len(self.values):
+                return None
+            return f"/{self.arg_of} {self.values[self.highlighted][0]}"
+        cmd = self.current
+        return f"/{cmd.name} " if cmd else None
 
 
 class CommandInput(TextArea):
@@ -129,10 +192,25 @@ class CommandInput(TextArea):
 
     def _update_menu(self) -> None:
         value = self.value
-        if value.startswith("/") and not any(c.isspace() for c in value):
-            self.menu.show(matching(self._commands(), value[1:]))
-        else:
+        if not value.startswith("/") or "\n" in value:
             self.menu.hide()
+            return
+        name, sep, arg = value[1:].partition(" ")
+        if not sep:
+            if name and name[0].isspace():
+                self.menu.hide()
+            else:
+                self.menu.show(matching(self._commands(), name))
+            return
+        # `/command ` and the start of its first argument: the values it can take.
+        cmd = next((c for c in self._commands() if c.name == name), None)
+        options = arg_options(cmd) if cmd and name and not any(
+            c.isspace() for c in arg) else []
+        shown = matching_options(options, arg)
+        if not shown or (len(shown) == 1 and shown[0][0] == arg):
+            self.menu.hide()  # nothing to offer, or already typed in full
+        else:
+            self.menu.show_args(name, shown)
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
         if event.text_area is self:
@@ -142,16 +220,17 @@ class CommandInput(TextArea):
         self.menu.hide()
 
     def _complete(self) -> bool:
-        cmd = self.menu.current
-        if cmd is None:
+        """Put the highlighted entry in the input. A command keeps the menu open on
+        its arguments, if it has any."""
+        target = self.menu.completion
+        if target is None:
             return False
-        self.value = f"/{cmd.name} "
-        self.menu.hide()
+        self.value = target  # updates the menu
         return True
 
     def pick(self, index: int) -> None:
-        """Complete with the command at `index` in the list (clicked with the mouse)."""
-        if self.menu_open and 0 <= index < len(self.menu.commands):
+        """Complete with the entry at `index` in the list (clicked with the mouse)."""
+        if self.menu_open and 0 <= index < self.menu.count:
             self.menu.highlighted = index
             self._complete()
         self.focus()
@@ -214,9 +293,12 @@ class CommandInput(TextArea):
         await super()._on_key(event)
 
     async def action_submit(self) -> None:
-        # Enter on an unfinished `/comm` picks the highlighted command first.
-        cmd = self.menu.current if self.menu_open else None
-        if cmd is not None and self.value.strip() != f"/{cmd.name}":
+        target = self.menu.completion if self.menu_open else None
+        if target is not None and self.menu.arg_of:
+            # Enter on an argument picks it and sends: `/model op` -> `/model opus`.
+            self.value = target
+        elif target is not None and self.value.strip() != target.strip():
+            # Enter on an unfinished `/comm` picks the highlighted command first.
             self._complete()
             return
         self.menu.hide()

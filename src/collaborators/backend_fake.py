@@ -32,12 +32,22 @@ Brain = Callable[["FakeSession", str], AsyncIterator[Event]]
 
 DEMO_COMMANDS = [
     Command("code-review", "Review the current diff for correctness bugs", "[low|medium|high]"),
+    Command("effort", "Set the reasoning effort", "<low|medium|high|xhigh|max>"),
     Command("simplify", "Review the changed code for reuse and simplification"),
     Command("compact", "Clear history but keep a summary in context", "[instructions]"),
     Command("context", "Show what is using the context window"),
     Command("model", "Set the AI model for this session", "[model]"),
     Command("security-review", "Security review of the pending changes"),
     Command("init", "Initialize a CLAUDE.md file with codebase documentation"),
+]
+
+
+DEMO_MODELS = [
+    ("default", "Default (recommended) · Opus 5.5"),
+    ("opus", "Opus 5.5 · For complex work and everyday tasks"),
+    ("fable", "Fable 5.2 · For your toughest challenges"),
+    ("sonnet", "Sonnet 5.5 · Most efficient for simpler tasks"),
+    ("haiku", "Haiku 5.5 · Fastest for quick answers"),
 ]
 
 
@@ -53,7 +63,9 @@ class FakeSession:
         self._n = 0
         self.last_tool_output = ""
         self.commands: list[Command] = list(DEMO_COMMANDS)
+        self.models: list[tuple[str, str]] = list(DEMO_MODELS)
         self.remote_url: str | None = None
+        self.remote_requests: list[bool] = []  # every Remote Control request, for tests
 
     @property
     def name(self) -> str:
@@ -70,6 +82,7 @@ class FakeSession:
         self._interrupted.set()
 
     async def set_remote_control(self, enabled: bool, name: str | None = None) -> str | None:
+        self.remote_requests.append(enabled)
         await self.pause(0.2)
         self.remote_url = "https://claude.ai/code/session_demo (demo: not a real link)" \
             if enabled else None

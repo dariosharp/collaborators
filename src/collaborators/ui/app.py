@@ -5,16 +5,17 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import subprocess
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import replace
 from typing import Any
 
 from textual import events
-from textual.app import App, ComposeResult, SystemCommand
+from textual.app import App, ComposeResult, SuspendNotSupported, SystemCommand
 from textual.binding import Binding
 from textual.screen import Screen
-from textual.widgets import Footer, Input, TabbedContent, TabPane, TextArea
+from textual.widgets import Input, TabbedContent, TabPane, TextArea
 
 from .. import accounts
 from ..agents import Backend, Command
@@ -89,8 +90,7 @@ class CollabApp(App[None]):
     def compose(self) -> ComposeResult:
         yield TopBar(self.cfg.workdir, "", self._account_label())
         yield TabbedContent(id="teams")
-        yield ModeLine()
-        yield Footer()
+        yield ModeLine()  # no Footer: the keys are in F1 help and the mode line
 
     async def on_mount(self) -> None:
         for theme in THEMES:
@@ -354,16 +354,17 @@ class CollabApp(App[None]):
             return ""  # only Claude Code's own login: nothing worth showing
         return self.account
 
-    def action_switch_account(self, name: str | None = None, note: str = "") -> None:
+    def action_switch_account(self, name: str | None = None, note: str = "",
+                              adding: bool = False) -> None:
         """/switch: pick an account (or go straight to `name`); every agent of every
-        team carries on with its conversation under it."""
+        team carries on with its conversation under it. `adding`: start by adding one."""
         if name is None:
             def chosen(choice: str | None) -> None:
                 if choice:
                     self.action_switch_account(choice)
                 else:
                     self.query_one(TopBar).set_account(self._account_label())
-            self.push_screen(AccountScreen(self.account, note), chosen)
+            self.push_screen(AccountScreen(self.account, note, adding=adding), chosen)
             return
         name = name.strip().lower()
         if name == self.account:
@@ -389,6 +390,61 @@ class CollabApp(App[None]):
                     title="Accounts")
         await asyncio.gather(*(v.switch_account(name, env) for v in self.views),
                              return_exceptions=True)
+
+    def account_updated(self, name: str) -> None:
+        """The account `name` was re-added: if the team runs under it, restart the
+        agents with its new environment (each keeps its conversation)."""
+        if name != self.account:
+            return
+        try:
+            env = accounts.env_for(name)
+        except ConfigError as exc:
+            self.notify(str(exc), title="Accounts", severity="error")
+            return
+        self.run_worker(self._switch_to(name, env), exit_on_error=False)
+
+    def login_account(self, name: str, done: Callable[[str], None]) -> None:
+        """Add `name` as a claude.ai login account: prepare its config dir, run
+        `claude auth login --claudeai` in the terminal (collab steps aside meanwhile),
+        check it and register it; then `done(name)`. Where collab cannot step aside,
+        it shows the command to run in another terminal instead."""
+        try:
+            path = accounts.prepare_login_dir(accounts.login_dir(name))
+        except OSError as exc:
+            self.notify(f"Cannot prepare the account's config dir: {exc}",
+                        title="Accounts", severity="error")
+            return
+
+        async def verify() -> None:
+            try:
+                who = await asyncio.to_thread(accounts.check_login, name)
+            except ConfigError as exc:
+                self.notify(str(exc), title="Accounts", severity="error", timeout=20)
+                return
+            self.notify(f"{name!r} is logged in with claude.ai ({who}).", title="Accounts")
+            done(name)
+            self.account_updated(name)
+
+        try:
+            with self.suspend():
+                print(f"\nLogging the collab account {name!r} in with claude.ai "
+                      f"(config dir {path}).\n", flush=True)
+                try:
+                    subprocess.run(accounts.login_command(), env=accounts.claude_env(path),
+                                   check=False)
+                except OSError as exc:
+                    print(f"collab: cannot run claude: {exc}", flush=True)
+        except SuspendNotSupported:
+            def answer(yes: bool | None) -> None:
+                if yes:
+                    self.run_worker(verify(), exit_on_error=False)
+
+            self.push_screen(ConfirmScreen(
+                f"Log {name!r} in from another terminal",
+                f"Run this, sign in with that Claude account, then press y here:\n\n"
+                f"  {accounts.login_hint(path)}"), answer)
+            return
+        self.run_worker(verify(), exit_on_error=False)
 
     def limit_reached(self, event: LimitReached) -> None:
         """An agent hit the account's usage limit: offer another account, once."""

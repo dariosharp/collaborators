@@ -57,8 +57,9 @@ Then describe what you want, e.g.
 | `Enter` | send your message to the Lead / open the focused agent |
 | `Ctrl+J` or `\` `Enter` | **new line** in your message (also `Shift+Enter` in terminals that report it: kitty, WezTerm, Ghostty, foot, iTerm2) |
 | `/` | **Claude Code slash commands and skills** (yours and the project's), with completion: `↑`/`↓` choose, `Tab` completes — to the Lead, or to one agent from its transcript |
+| `/command ` | **its possible values**, suggested as you type: the accounts for `/switch`, the models for `/model`, the levels for `/effort` and `/code-review`, `on`/`off`… — `Enter` picks and sends |
 | `/switch` | **switch Claude account** (or `/switch <name>`): every agent carries on with its conversation — see [Several accounts](#several-accounts) |
-| `/remote-control` | **continue with the Lead from claude.ai/code or the Claude app**; `/remote-control off` stops it (or start with `collab --remote-control`) |
+| `/remote-control` | **continue with the Lead from claude.ai/code or the Claude app**; `/remote-control off` stops it (or start with `collab --remote-control`); not on setup-token accounts |
 | `F2` / `F3` | **add a worker / a tester** — the Lead is told immediately and can use it at once |
 | `Delete` | **remove the focused worker or tester** (after a confirmation; a running task is cancelled) |
 | `Ctrl+N` | **open another team in a new tab** (its own Lead, workers and testers), e.g. one for the frontend and one for the backend |
@@ -165,7 +166,7 @@ Defaults:
 |---|---|---|
 | Lead | `claude-fable-5-2` | medium |
 | Worker | `claude-opus-5-5` | medium |
-| Tester | `claude-opus-4-8` | medium |
+| Tester | `claude-sonnet-5-5` | medium |
 
 Override them in `~/.config/collaborators/config.toml` (for every project) or
 `<project>/.collab/config.toml` (for one project). Command-line flags win over both.
@@ -198,22 +199,40 @@ collab --remote-control   # reach the Lead from claude.ai/code or your phone too
 ## Several accounts
 
 If you have more than one Claude account, collab can run the agents under any of
-them and move between them without losing a conversation — for instance when one
-hits its usage limit.
+them and switch between them while they work: every agent keeps its conversation.
+An account signs in one of two ways:
 
-1. For each extra account, run `claude setup-token` in a terminal, sign in with that
-   account and copy the token it prints.
-2. In collab type `/switch`, press `a`, give the account a name (e.g. `work`) and
-   paste the token. It is kept in `~/.config/collaborators/accounts.json`, readable
-   only by you.
-3. `/switch work` (or `/switch` and Enter) moves every agent of every tab to it.
+- **claude.ai login** (recommended): the account gets its own Claude Code config
+  dir, `~/.config/collaborators/accounts/<name>/`, with its own login in it.
+  Conversations, settings, skills, plugins and history are symlinks to
+  `~/.claude`, and MCP servers and trusted projects are copied over from
+  `~/.claude.json` on every switch. **Remote Control works.**
+- **setup-token**: a long-lived token from `claude setup-token`. Inference only:
+  **no Remote Control.**
+
+To add one (say `personal`):
+
+1. In collab type `/switch add` (or `/switch`, then `a`), name it `personal`, and
+   pick **log in with claude.ai**. collab steps aside and runs
+   `claude auth login --claudeai` in the terminal: sign in with that account in the
+   browser, and collab comes back and checks the login. From a plain terminal,
+   `collab account login personal` does the same (`collab account list` shows the
+   accounts).
+2. `/switch personal` (or `/switch` and Enter) moves every agent of every tab to it.
    Idle agents switch at once, busy ones when their turn ends; each resumes the
    same conversation.
+
+Re-adding an existing name replaces how it signs in: that is how a setup-token
+account becomes a claude.ai login one. For a token instead, pick **paste a token**
+and paste what `claude setup-token` prints; it is kept in
+`~/.config/collaborators/accounts.json`, readable only by you.
 
 `login` is always there: Claude Code's own login. When an account hits its usage
 limit, collab offers to switch to another one (`y`), and tells the Lead which tasks
 stopped so it can pick them up again. The account in use shows in the top bar, is
 remembered for next time, and can be chosen at start with `collab --account work`.
+Switching to a setup-token account turns Remote Control off (collab says so);
+between `login` and claude.ai login accounts it stays on.
 
 > If `ANTHROPIC_API_KEY` is set in your environment, Claude Code uses it before any
 > account token: unset it to use your accounts.

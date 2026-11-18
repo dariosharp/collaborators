@@ -6,12 +6,14 @@ import asyncio
 import contextlib
 import re
 from collections import defaultdict
+from dataclasses import replace
 from typing import Any
 
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 
+from .. import accounts
 from ..agents import Backend, Command, Decision
 from ..config import DEFAULT_TEAM, TeamConfig
 from ..events import (
@@ -28,7 +30,7 @@ from ..events import (
     TurnResult,
 )
 from ..orchestrator import LEAD, Hub, Team
-from .screens import AgentDetailScreen, ApprovalScreen, ConfirmScreen
+from .screens import AgentDetailScreen, ApprovalScreen, ConfirmScreen, describe_account
 from .widgets import AgentCard, LeadPanel, StatsBar
 
 HISTORY_LIMIT = 3000
@@ -36,7 +38,8 @@ HISTORY_LIMIT = 3000
 # you have probably switched to something else, short replies don't ping you.
 NOTIFY_AFTER_S = 30.0
 REMOTE_CMD = Command("remote-control", "Control the Lead from claude.ai/code or the Claude "
-                     "app (collab)", "[off]")
+                     "app (collab)", "[off]",
+                     options=(("off", "stop Remote Control"),))
 SWITCH_CMD = Command("switch", "Switch Claude account; every conversation carries on "
                      "(collab)", "[account]")
 MODEL_SET = re.compile(r"Set model to `([^`]+)`")
@@ -272,9 +275,21 @@ class TeamView(Vertical):
             return []
         extra = [REMOTE_CMD] if agent == LEAD and self.team.remote_control_available else []
         if agent == LEAD:
-            extra.append(SWITCH_CMD)
+            extra.append(replace(SWITCH_CMD, options=self._account_options()))
         ours = {c.name for c in extra}
-        return extra + [c for c in runner.commands if c.name not in ours]
+        models = tuple(runner.models)
+        return extra + [replace(c, options=models) if c.name == "model" and models else c
+                        for c in runner.commands if c.name not in ours]
+
+    def _account_options(self) -> tuple[tuple[str, str], ...]:
+        """/switch completion: the other accounts first, the one in use last."""
+        current = getattr(self.app, "account", accounts.LOGIN)
+        names = accounts.names()
+        def describe(name: str) -> str:
+            return describe_account(name) + (" · in use" if name == current else "")
+        listed = [n for n in names if n != current] + [n for n in names if n == current]
+        return (*((n, describe(n)) for n in listed),
+                (accounts.ADD, "add an account: claude.ai login or a setup-token"))
 
     @property
     def remote_url(self) -> str | None:
@@ -324,7 +339,11 @@ class TeamView(Vertical):
             if parts and parts[0] == REMOTE_CMD.name and self.team.remote_control_available:
                 self.set_remote_control(not (len(parts) > 1 and parts[1] == "off"))
             elif parts and parts[0] == SWITCH_CMD.name:
-                self.app.action_switch_account(parts[1] if len(parts) > 1 else None)
+                arg = parts[1].lower() if len(parts) > 1 else None
+                if arg == accounts.ADD:
+                    self.app.action_switch_account(adding=True)
+                else:
+                    self.app.action_switch_account(arg)
             elif self.check_command(LEAD, message.text):
                 self.team.tell_lead(message.text, chat=False)
             return
