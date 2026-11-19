@@ -15,7 +15,7 @@ from textual.message import Message
 
 from .. import accounts
 from ..agents import Backend, Command, Decision
-from ..config import DEFAULT_TEAM, TeamConfig
+from ..config import DEFAULT_MODEL, DEFAULT_TEAM, TeamConfig, is_default_model, is_model_id
 from ..events import (
     AgentAdded,
     AgentRemoved,
@@ -28,10 +28,11 @@ from ..events import (
     TaskUpdate,
     TextDone,
     TurnResult,
+    UsageChanged,
 )
 from ..orchestrator import LEAD, Hub, Team
 from .screens import AgentDetailScreen, ApprovalScreen, ConfirmScreen, describe_account
-from .widgets import AgentCard, LeadPanel, StatsBar
+from .widgets import BUSY_STATUSES, AgentCard, LeadPanel, StatsBar
 
 HISTORY_LIMIT = 3000
 # A Lead turn at least this long ends with a desktop notification: long enough that
@@ -43,6 +44,17 @@ REMOTE_CMD = Command("remote-control", "Control the Lead from claude.ai/code or 
 SWITCH_CMD = Command("switch", "Switch Claude account; every conversation carries on "
                      "(collab)", "[account]")
 MODEL_SET = re.compile(r"Set model to `([^`]+)`")
+
+
+def model_from_switch(typed: str | None, shown: str) -> str | None:
+    """The model to keep after `/model`: what Claude Code accepts, not the display name
+    it answers with ("Set model to `Opus 5.5 (default)`"). `typed` is the argument the
+    user gave /model, if any. None: nothing usable, keep the current model."""
+    if (typed is not None and is_default_model(typed)) or "(default)" in shown.lower():
+        return DEFAULT_MODEL
+    if typed and is_model_id(typed):
+        return typed
+    return shown if is_model_id(shown) else None
 
 
 class TeamView(Vertical):
@@ -67,6 +79,7 @@ class TeamView(Vertical):
         self.remote_control_at_start = remote_control
         self.history: dict[str, list[Event]] = defaultdict(list)
         self.tasks: dict[str, TaskRecord] = {}
+        self._model_typed: dict[str, str | None] = {}  # the last `/model X` per agent
         self.team: Team | None = None
         self._restart_note = ""
         self._stopping = False
@@ -126,8 +139,7 @@ class TeamView(Vertical):
     @property
     def busy(self) -> bool:
         leads = self.query(LeadPanel)
-        lead_busy = bool(leads) and leads.first().status in (AgentStatus.RUNNING,
-                                                              AgentStatus.STARTING)
+        lead_busy = bool(leads) and leads.first().status in BUSY_STATUSES
         return lead_busy or any(not t.status.finished for t in self.tasks.values())
 
     def tab_label(self) -> str:
@@ -158,10 +170,11 @@ class TeamView(Vertical):
     def on_team_event(self, event: Event) -> None:
         if self._stopping:
             return
-        hist = self.history[event.agent]
-        hist.append(event)
-        if len(hist) > HISTORY_LIMIT:
-            del hist[: len(hist) - HISTORY_LIMIT]
+        if not isinstance(event, UsageChanged):  # transcript events only
+            hist = self.history[event.agent]
+            hist.append(event)
+            if len(hist) > HISTORY_LIMIT:
+                del hist[: len(hist) - HISTORY_LIMIT]
 
         if isinstance(event, AgentAdded):
             self._mount_card(event.agent)
@@ -199,6 +212,9 @@ class TeamView(Vertical):
             if event.status is AgentStatus.ERROR and event.detail:
                 self.notify(event.detail, title=f"{self._who(event.agent)} error",
                             severity="error")
+        elif isinstance(event, UsageChanged):
+            target.set_usage(event.usage)
+            return
         else:
             target.feed(event)
         screen = self.app.screen
@@ -225,7 +241,9 @@ class TeamView(Vertical):
         m = MODEL_SET.match(event.text)
         if m is None or self.team is None or event.agent not in self.team.runners:
             return
-        self.team.runners[event.agent].spec.model = m.group(1)
+        model = model_from_switch(self._model_typed.pop(event.agent, None), m.group(1))
+        if model is not None:
+            self.team.model_chosen(event.agent, model)
         target: Any = self.query_one(LeadPanel) if event.agent == LEAD else \
             self._card(event.agent)
         if target is not None:
@@ -376,6 +394,9 @@ class TeamView(Vertical):
                         "/code-review.", severity="warning")
             return False
         known = {c.name for c in self.commands_for(agent)}
+        if name == "model":  # what the user typed is what Claude Code accepts
+            args = rest.split()[1:]
+            self._model_typed[agent] = args[0] if args else None
         if known and name not in known:
             self.notify(f"/{name} isn't available here. Agents run as headless Claude Code "
                         "sessions, so commands that drive the interactive terminal (such as "

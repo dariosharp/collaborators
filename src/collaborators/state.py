@@ -18,6 +18,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from .config import is_model_id
 from .events import TaskRecord
 
 STATE_VERSION = 1
@@ -28,6 +29,7 @@ class StateStore:
         self.dir = state_dir
         self.team_file = state_dir / "team.json"
         self.tasks_file = state_dir / "tasks.jsonl"
+        self.reports_dir = state_dir / "reports"  # every task's full final report
 
     def ensure(self) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -46,6 +48,20 @@ class StateStore:
         return {name: info["session_id"] for name, info in agents.items()
                 if isinstance(info, dict) and isinstance(info.get("session_id"), str)}
 
+    def load_models(self) -> dict[str, str]:
+        """The models the user picked with /model, by agent (saved with model_chosen):
+        the only saved models that win over the config on --resume."""
+        try:
+            data = json.loads(self.team_file.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+        agents = data.get("agents", {}) if isinstance(data, dict) else {}
+        # A display name ("Opus 5.5 (default)", saved by older versions) is not a
+        # model Claude Code accepts: skip it, so the config's model is used instead.
+        return {name: info["model"] for name, info in agents.items()
+                if isinstance(info, dict) and info.get("model_chosen")
+                and isinstance(info.get("model"), str) and is_model_id(info["model"])}
+
     def save_sessions(self, sessions: dict[str, str], meta: dict[str, dict[str, Any]]) -> None:
         self.ensure()
         payload = {
@@ -62,6 +78,13 @@ class StateStore:
         self.ensure()
         with self.tasks_file.open("a") as fh:
             fh.write(json.dumps(task.to_json()) + "\n")
+
+    def save_report(self, task_id: str, text: str) -> Path:
+        self.ensure()
+        self.reports_dir.mkdir(exist_ok=True)
+        path = self.reports_dir / f"{task_id}.md"
+        path.write_text(text if text.endswith("\n") else text + "\n")
+        return path
 
     def last_task_number(self) -> int:
         """Highest T<n> id on record, so task ids keep counting across restarts."""

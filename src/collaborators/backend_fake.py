@@ -22,6 +22,7 @@ from .events import (
     ToolResult,
     TurnResult,
 )
+from .usage import TokenUsage
 
 # A prompt containing this plays a turn cut off by the account's usage limit.
 LIMIT_MARK = "[demo:limit]"
@@ -65,6 +66,10 @@ class FakeSession:
         self.commands: list[Command] = list(DEMO_COMMANDS)
         self.models: list[tuple[str, str]] = list(DEMO_MODELS)
         self.remote_url: str | None = None
+        self.context = 0  # tokens in its (pretend) context, see done()
+        self.compact_fails = False  # tests: make the next /compact fail
+        self.compact_gate: asyncio.Event | None = None  # tests: hold /compact until set
+        self.compactions: list[str] = []  # the instructions of every /compact
         self.remote_requests: list[bool] = []  # every Remote Control request, for tests
 
     @property
@@ -98,15 +103,38 @@ class FakeSession:
         self._n += 1
         return f"{self.name}-tool-{self._n}"
 
+    async def context_size(self) -> int | None:
+        return self.context or None
+
     async def run(self, prompt: str) -> AsyncIterator[Event]:
         self.prompts.append(prompt)
         self._interrupted.clear()
+        if prompt.startswith("/compact"):  # like Claude Code: summarise, start over
+            async for event in self._compact(prompt.removeprefix("/compact").strip()):
+                yield event
+            return
         async for event in self.brain(self, prompt):
             if self._interrupted.is_set():
                 yield TurnResult(self.name, "Interrupted by user.", is_error=True,
                                  subtype="error_during_execution")
                 return
             yield event
+
+    async def _compact(self, instructions: str) -> AsyncIterator[Event]:
+        self.compactions.append(instructions)
+        await self.pause(0.5)
+        if self.compact_gate is not None:
+            await self.compact_gate.wait()
+        if self.compact_fails:
+            yield TurnResult(self.name, "Error during compaction: demo failure",
+                             is_error=True, subtype="error_during_execution")
+            return
+        read = self.context
+        self.context = 18_000 + read // 10  # system prompt and tools, plus the summary
+        yield TurnResult(self.name, "Compacted", cost_usd=0.0, num_turns=1,
+                         session_id=self.session_id,
+                         usage=TokenUsage(input=20, output=read // 10, cache_read=read),
+                         context_tokens=read)
 
     # ---- helpers for brains -------------------------------------------------
     async def say(self, text: str, chunk: int = 6) -> AsyncIterator[Event]:
@@ -139,9 +167,19 @@ class FakeSession:
                          session_id=self.session_id)
 
     def done(self, text: str, cost: float = 0.0, turns: int = 1) -> TurnResult:
+        """The turn's result, with plausible tokens: the context grows with every turn,
+        and each model call re-reads it (mostly from the cache)."""
+        output = 300 * turns
+        start = self.context or 18_000  # system prompt and tools
+        self.context = start + 2_500 * turns + output
+        usage = TokenUsage(input=40 * turns, output=output,
+                           cache_read=start * turns + 1_000 * turns * (turns - 1),
+                           cache_write=2_500 * turns, cost_usd=cost)
         return TurnResult(self.name, text, cost_usd=cost, num_turns=turns,
-                          duration_ms=0, input_tokens=1200 * turns, output_tokens=300 * turns,
-                          session_id=self.session_id)
+                          duration_ms=0, input_tokens=usage.input + usage.cache_read
+                          + usage.cache_write, output_tokens=output,
+                          session_id=self.session_id, usage=usage,
+                          context_tokens=self.context)
 
 
 # ---- the demo script ----------------------------------------------------------
@@ -153,7 +191,10 @@ async def demo_brain(s: FakeSession, prompt: str) -> AsyncIterator[Event]:
         return
     if prompt.startswith("/model"):
         arg = prompt.removeprefix("/model").strip()
-        text = (f"Set model to `{arg}` for this session only" if arg else
+        # Like Claude Code, answer with the display name, not the alias typed.
+        shown = {"default": "Opus 5.5 (default)", "opus": "Opus 5.5", "fable": "Fable 5.2",
+                 "sonnet": "Sonnet 5.5", "haiku": "Haiku 5.5"}.get(arg, arg)
+        text = (f"Set model to `{shown}` for this session only" if arg else
                 f"Current model: `{s.spec.model}` (effort: {s.spec.effort})")
         async for e in s.say(text):
             yield e

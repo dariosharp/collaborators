@@ -149,3 +149,13 @@ async def test_usage_limit_is_reported(tmp_path):
     client.query = FakeClient.query.__get__(client)  # type: ignore[method-assign]
     assert not (await runner.run("again")).limited
     await session.close()
+
+
+def test_options_pass_no_model_for_the_default(tmp_path):
+    def options(model: str):
+        spec = AgentSpec(name="lead", role="lead", model=model, effort="medium",
+                         cwd=tmp_path, system_append="", session_id="s")
+        return SdkSession(spec)._options()
+    assert options("default").model is None
+    assert options("").model is None
+    assert options("claude-opus-5-5").model == "claude-opus-5-5"

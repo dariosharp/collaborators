@@ -12,7 +12,7 @@ from typing import Any
 
 from . import accounts
 from .agents import AgentRunner, AgentSpec, Approver, Backend, Emit, ToolSpec
-from .config import TeamConfig
+from .config import TeamConfig, is_model_id, model_label
 from .events import (
     AgentAdded,
     AgentRemoved,
@@ -26,6 +26,7 @@ from .events import (
 from .gitsnap import Tree
 from .prompts import prompt_for
 from .state import StateStore, new_session_id
+from .usage import fmt_context, fmt_tokens
 from .workspace import Workspace
 
 log = logging.getLogger(__name__)
@@ -37,6 +38,19 @@ MAX_AGENTS = 16
 # Lead-to-Lead messages a Lead may send before the user talks to it again:
 # enough to agree on an API, not enough for two models to chat away the quota.
 PEER_MESSAGE_BUDGET = 4
+# What /compact keeps (its focus instructions), by role.
+COMPACT_KEEP = {
+    "lead": "Keep: the user's goals and decisions, open tasks and their state, what each "
+            "agent did.",
+    "worker": "Keep precisely: the exact paths of files you changed or studied and why; "
+              "functions/classes and signatures you touched; project conventions, style "
+              "and architecture you learned; how to run the tests and linters and their "
+              "current state; decisions taken and their reasons; known pitfalls, fragile "
+              "spots and open TODOs. Drop: raw file contents, long tool outputs, "
+              "superseded attempts. After compaction, re-read a file before editing it if "
+              "you need exact details.",
+}
+COMPACT_KEEP["tester"] = COMPACT_KEEP["worker"]
 # Remote Control goes through claude.ai, which needs a claude.ai login: a
 # `claude setup-token` token is inference-only, and the CLI rejects it.
 REMOTE_NEEDS_LOGIN = (f"Remote Control needs a claude.ai login: accounts added with a "
@@ -130,6 +144,7 @@ class Team:
         self._counter = self.store.last_task_number()
         self._lead_inbox: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
         self._lead_loop: asyncio.Task[None] | None = None
+        self._compactions: set[asyncio.Task[bool]] = set()
         self.started_at = time.time()
 
         self._backend = backend
@@ -143,6 +158,9 @@ class Team:
         self._notes: list[tuple[str, str]] = []  # (from, text) that interrupted a wait
         self._note_news = asyncio.Event()
         previous = self.store.load_sessions() if resume else {}
+        # Models the user picked with /model come back on --resume; any other saved
+        # model (e.g. an old built-in default) gives way to the config.
+        self._chosen_models: dict[str, str] = self.store.load_models() if resume else {}
         # On --resume, agents added at runtime last time come back too.
         names = list(cfg.agent_names)
         for role in ("worker", "tester"):
@@ -159,7 +177,8 @@ class Team:
         role = self.cfg.role_of(name)
         rc = self.cfg.role_config(name)
         spec = AgentSpec(
-            name=name, role=role, model=rc.model, effort=rc.effort, cwd=self.ws.cwd_for(name),
+            name=name, role=role, model=self._chosen_models.get(name, rc.model),
+            effort=rc.effort, cwd=self.ws.cwd_for(name),
             system_append=prompt_for(self.cfg, name, self._initial_names, self.ws.isolated),
             session_id=self._previous.get(name) or new_session_id(),
             resume=name in self._previous,
@@ -177,8 +196,21 @@ class Team:
     def _save_sessions(self) -> None:
         self.store.save_sessions(
             {n: r.spec.session_id for n, r in self.runners.items()},
-            {n: {"model": r.spec.model, "effort": r.spec.effort} for n, r in self.runners.items()},
+            {n: {"model": r.spec.model, "effort": r.spec.effort,
+                 **({"model_chosen": True} if n in self._chosen_models else {})}
+             for n, r in self.runners.items()},
         )
+
+    def model_chosen(self, agent: str, model: str) -> None:
+        """The user switched `agent` to `model` with /model: keep it, also on --resume.
+        `model` must be what Claude Code accepts (an id, an alias or "default")."""
+        runner = self.runners.get(agent)
+        if runner is None or not is_model_id(model):
+            return
+        runner.spec.model = model
+        self._chosen_models[agent] = model
+        with contextlib.suppress(OSError):
+            self._save_sessions()
 
     @property
     def agent_names(self) -> list[str]:
@@ -201,7 +233,8 @@ class Team:
             await runner.start()
         except Exception:
             return name  # the card shows the error; the Lead isn't told about a dead agent
-        self._announce(f"{name} ({role}, {runner.spec.model}, effort {runner.spec.effort}) "
+        self._announce(f"{name} ({role}, {model_label(runner.spec.model)}, effort "
+                       f"{runner.spec.effort}) "
                        "joined the team and is idle, ready for tasks.")
         return name
 
@@ -214,6 +247,7 @@ class Team:
         # Gone from the roster first, so nothing new can be dispatched to it meanwhile.
         runner = self.runners.pop(name)
         self._previous.pop(name, None)  # re-adding the same name starts a fresh session
+        self._chosen_models.pop(name, None)  # …on the configured model
         self._save_sessions()
         task = next((t for t in self._running_tasks() if t.agent == name), None)
         if task is not None:
@@ -350,9 +384,10 @@ class Team:
             del self.hub.teams[self.name]
         if self._lead_loop:
             self._lead_loop.cancel()
-        for job in self._jobs.values():
+        for job in [*self._jobs.values(), *self._compactions]:
             job.cancel()
-        await asyncio.gather(*self._jobs.values(), return_exceptions=True)
+        await asyncio.gather(*self._jobs.values(), *self._compactions,
+                             return_exceptions=True)
         if self._lead_loop:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._lead_loop
@@ -470,11 +505,15 @@ class Team:
                 payload = "[team] A task finished while you were not waiting for it.\n\n" + \
                     self.task_report(self.tasks[payload])
             try:
-                await lead.run(payload)
+                result = await lead.run(payload)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # keep the inbox alive
                 self._ui_emit(Notice(LEAD, f"Lead error: {exc}", "error"))
+                continue
+            # Nothing waiting for the Lead: compact now, while its cache is warm.
+            if self._lead_inbox.empty() and not result.limited:
+                await self._compact_if_needed(LEAD)
 
     # ---- tasks ------------------------------------------------------------
     def resolve_agent(self, name: str) -> str:
@@ -493,7 +532,8 @@ class Team:
             raise ValueError("the Lead cannot dispatch tasks to itself")
         runner = self.runners[agent]
         busy = next((t for t in self._running_tasks() if t.agent == agent), None)
-        if busy or runner.busy:
+        # A compaction after its last task is fine: the new task waits for it.
+        if busy or (runner.busy and not runner.compacting):
             raise ValueError(f"{agent} is busy" + (f" with {busy.id}" if busy else "")
                              + "; wait for it or pick another agent")
         planned = [self._norm(f) for f in files or []]
@@ -522,6 +562,16 @@ class Team:
         runner = self.runners[task.agent]
         tree = self.ws.tree_for(task.agent)
         cancelled = False
+        if self.cfg.role_of(task.agent) == "tester" and not self.cfg.tester_memory \
+                and runner._ran:
+            # Testers verify from scratch: a self-contained task, a new conversation.
+            try:
+                await runner.start_fresh(self._backend, new_session_id(),
+                                         f"— new session for {task.id} —")
+                self._save_sessions()
+            except Exception as exc:
+                self._ui_emit(Notice(task.agent, f"Could not start a new session ({exc}); "
+                                                 "going on in the old one.", "warning"))
         if tree is not None:
             try:
                 if self.ws.isolates(task.agent):
@@ -536,6 +586,16 @@ class Team:
             task.cost_usd = result.cost_usd
             task.num_turns = result.num_turns
             task.limited = result.limited
+            if result.usage is not None:
+                task.input_tokens = result.usage.input
+                task.output_tokens = result.usage.output
+                task.cache_read_tokens = result.usage.cache_read
+                task.cache_write_tokens = result.usage.cache_write
+            task.context_tokens = runner.usage.context_tokens
+            if result.text.strip():
+                with contextlib.suppress(OSError):
+                    path = self.store.save_report(task.id, result.text)
+                    task.report_file = self._rel(path)
             if task.status is not TaskStatus.CANCELLED:
                 task.status = TaskStatus.FAILED if result.is_error else TaskStatus.DONE
         except asyncio.CancelledError:
@@ -561,6 +621,49 @@ class Team:
                 self.store.append_task(task)
             if task.origin == "lead" and not self._waiting.get(task.id):
                 self._lead_inbox.put_nowait(("task_done", task.id))
+            # The report is out; compact now, while the agent's cache is warm.
+            if not cancelled and not task.limited:
+                job = asyncio.create_task(self._compact_if_needed(task.agent),
+                                          name=f"{task.agent}-compact")
+                self._compactions.add(job)
+                job.add_done_callback(self._compactions.discard)
+
+    async def _compact_if_needed(self, agent: str) -> bool:
+        """/compact `agent` if its context is above its compact_at threshold. Never in
+        the middle of a task: only between tasks, once the last report is out."""
+        runner = self.runners.get(agent)
+        limit = self.cfg.compact_threshold(agent)
+
+        def needed() -> bool:
+            size = runner.usage.context_tokens if runner else None
+            between_tasks = not any(t.agent == agent for t in self._running_tasks())
+            return bool(limit) and size is not None and size >= limit and between_tasks
+
+        if runner is None or not needed():
+            return False
+        # Checked again once the agent is ours: a task sent meanwhile may have run first;
+        # its own end (report delivered) then decides.
+        return await runner.compact(COMPACT_KEEP[self.cfg.role_of(agent)], needed)
+
+    def _rel(self, path: Path) -> str:
+        try:
+            return str(path.relative_to(self.cfg.workdir))
+        except ValueError:
+            return str(path)
+
+    def _report_text(self, task: TaskRecord) -> str:
+        """The report as the Lead reads it: cut at report_max_chars, pointing to the
+        full one on disk."""
+        text = task.result.strip() or "(no text)"
+        cap = self.cfg.report_max_chars
+        if not cap or len(text) <= cap:
+            return text
+        cut = text[:cap]
+        if "\n" in cut[cap // 2:]:
+            cut = cut[:cut.rindex("\n")]  # at a line break, if there is one late enough
+        where = task.report_file or "the task board"
+        return (cut.rstrip() + f"\n… (truncated; full report: {where} — Read it if you "
+                "need the details)")
 
     async def wait(self, task_ids: list[str], mode: str = "all",
                    timeout: float | None = None, wake_on_news: bool = False) -> list[TaskRecord]:
@@ -710,6 +813,8 @@ class Team:
         head = f"{task.id} · {task.agent} · {task.status.value}"
         if task.status.finished:
             head += f" in {fmt_duration(task.elapsed)} · ${task.cost_usd:.2f}"
+            if task.context_tokens:
+                head += f" · {task.agent}'s context now {fmt_tokens(task.context_tokens)} tokens"
         else:
             head += f" for {fmt_duration(task.elapsed)} so far"
         lines = [head]
@@ -723,7 +828,7 @@ class Team:
                              f"directory until you call merge_work('{task.agent}'))")
         lines += [f"WARNING: {w}" for w in task.warnings]
         if task.status.finished:
-            lines += ["--- report ---", task.result.strip() or "(no text)"]
+            lines += ["--- report ---", self._report_text(task)]
         return "\n".join(lines)
 
     def status_report(self) -> str:
@@ -734,7 +839,8 @@ class Team:
             task = next((t for t in self._running_tasks() if t.agent == name), None)
             state = (f"busy with {task.id} ({fmt_duration(task.elapsed)})" if task
                      else runner.status.value)
-            lines.append(f"{name} [{runner.spec.model}, effort {runner.spec.effort}]: {state}")
+            lines.append(f"{name} [{model_label(runner.spec.model)}, effort "
+                         f"{runner.spec.effort}, {fmt_context(runner.usage)}]: {state}")
         finished = [t for t in self.tasks.values() if t.status.finished]
         if finished:
             lines.append("finished tasks: " + ", ".join(

@@ -33,7 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Claude Code permission mode for all agents (default bypassPermissions)")
     for role in ("lead", "worker", "tester"):
         p.add_argument(f"--{role}-model", default=None, metavar="MODEL",
-                       help=f"model for the {role}")
+                       help=f"model for the {role} ('default': Claude Code's own choice)")
         p.add_argument(f"--{role}-effort", choices=EFFORTS, default=None,
                        help=f"reasoning effort for the {role}")
     p.add_argument("--worktrees", action="store_true", default=None,

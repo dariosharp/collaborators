@@ -18,6 +18,7 @@ from textual.timer import Timer
 from textual.widgets import Static
 
 from ..agents import Command
+from ..config import is_default_model
 from ..events import (
     AgentStatus,
     Event,
@@ -34,6 +35,7 @@ from ..events import (
     UserPrompt,
 )
 from ..orchestrator import fmt_duration
+from ..usage import CONTEXT_STYLE, AgentUsage, context_level, fmt_context, fmt_tokens
 from .commands import CommandInput, CommandMenu
 from .render import TEAM, describe_call, describe_result, detail
 
@@ -41,7 +43,28 @@ SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 HOURGLASS = "⧗⧓⧖⧓"  # full, on its side, flipped over, on its side: an hourglass turning
 
 
+# Statuses with a spinner: the agent is doing something.
+BUSY_STATUSES = (AgentStatus.RUNNING, AgentStatus.STARTING, AgentStatus.COMPACTING)
+
+
+def usage_text(usage: AgentUsage | None) -> Text:
+    """` · ctx 137k · 2.4M tok` for a header: the context coloured by its size (dim,
+    yellow from CTX_WARN_TOKENS, red from CTX_HIGH_TOKENS), then the session's tokens.
+    Nothing until something is known."""
+    t = Text()
+    if usage is None:
+        return t
+    if usage.context_tokens is not None:
+        t.append(" · ", style="dim")
+        t.append(fmt_context(usage), style=CONTEXT_STYLE[context_level(usage.context_tokens)])
+    if usage.totals.total:
+        t.append(f" · {fmt_tokens(usage.totals.total)} tok", style="dim")
+    return t
+
+
 def short_model(model: str) -> str:
+    if is_default_model(model):
+        return "default model"  # Claude Code's own choice, until /model says otherwise
     return model.removeprefix("claude-")
 
 
@@ -260,6 +283,7 @@ class AgentCard(Vertical, can_focus=True):
         self.current: TaskRecord | None = None
         self.last_task: TaskRecord | None = None
         self.cost = 0.0
+        self.usage: AgentUsage | None = None
         self._frame = 0
 
     def compose(self) -> ComposeResult:
@@ -273,7 +297,7 @@ class AgentCard(Vertical, can_focus=True):
         self._render_header()
 
     def _tick(self) -> None:
-        if self.status in (AgentStatus.RUNNING, AgentStatus.STARTING):
+        if self.status in BUSY_STATUSES:
             self._frame = (self._frame + 1) % len(SPINNER)
             self._render_header()
 
@@ -288,6 +312,10 @@ class AgentCard(Vertical, can_focus=True):
         for hint in self.query(".hint"):
             hint.remove()
         self.query_one(Transcript).feed(event)
+        self._render_header()
+
+    def set_usage(self, usage: AgentUsage) -> None:
+        self.usage = usage
         self._render_header()
 
     def set_task(self, task: TaskRecord) -> None:
@@ -305,6 +333,7 @@ class AgentCard(Vertical, can_focus=True):
         icon = {
             AgentStatus.STARTING: SPINNER[self._frame],
             AgentStatus.RUNNING: SPINNER[self._frame],
+            AgentStatus.COMPACTING: SPINNER[self._frame],
             AgentStatus.IDLE: "○",
             AgentStatus.WAITING: "◉",
             AgentStatus.ERROR: "✗",
@@ -312,12 +341,15 @@ class AgentCard(Vertical, can_focus=True):
         t.append(f" {icon} ", style="bold")
         t.append(self.agent, style="bold")
         t.append(f"  {short_model(self.model)} · {self.effort}", style="dim")
+        t.append_text(usage_text(self.usage))
         right = Text()
         if self.current is not None:
             right.append(f"  {self.current.id} ", style="bold")
             right.append(fmt_duration(self.current.elapsed))
         elif self.status is AgentStatus.WAITING:
             right.append("  needs approval", style="bold")
+        elif self.status is AgentStatus.COMPACTING:
+            right.append("  compacting…", style="italic")
         elif self.status is AgentStatus.ERROR:
             right.append("  error", style="bold")
         elif self.last_task is not None:
@@ -363,6 +395,7 @@ class LeadPanel(Vertical):
         self.workdir = workdir
         self.placeholder = placeholder
         self.cost = 0.0
+        self.usage: AgentUsage | None = None
         self._frame = 0
 
     def compose(self) -> ComposeResult:
@@ -379,7 +412,7 @@ class LeadPanel(Vertical):
         self._render_header()
 
     def _tick(self) -> None:
-        if self.status in (AgentStatus.RUNNING, AgentStatus.STARTING):
+        if self.status in BUSY_STATUSES:
             self._frame = (self._frame + 1) % len(SPINNER)
             self._render_header()
 
@@ -391,12 +424,14 @@ class LeadPanel(Vertical):
     def _render_header(self) -> None:
         if not self.is_mounted:
             return
-        busy = self.status in (AgentStatus.RUNNING, AgentStatus.STARTING)
+        busy = self.status in BUSY_STATUSES
         t = Text(no_wrap=True, overflow="ellipsis")
         t.append(f" {SPINNER[self._frame] if busy else '◆'} ", style="bold")
         t.append("Lead", style="bold")
         t.append(f"  {short_model(self.model)} · {self.effort}", style="dim")
+        t.append_text(usage_text(self.usage))
         state = {AgentStatus.STARTING: "starting…", AgentStatus.RUNNING: "working…",
+                 AgentStatus.COMPACTING: "compacting…",
                  AgentStatus.IDLE: "ready", AgentStatus.WAITING: "needs approval",
                  AgentStatus.ERROR: "error"}[self.status]
         t.append(f"  {state}", style="italic")
@@ -405,6 +440,10 @@ class LeadPanel(Vertical):
         if self.cost:
             t.append(f"  ${self.cost:.2f}", style="dim")
         self.query_one("#lead-header", Static).update(t)
+
+    def set_usage(self, usage: AgentUsage) -> None:
+        self.usage = usage
+        self._render_header()
 
     def feed(self, event: Event) -> None:
         if isinstance(event, TurnResult):

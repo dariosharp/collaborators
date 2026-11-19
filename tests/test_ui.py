@@ -430,6 +430,22 @@ async def test_argument_completion(tmp_path, monkeypatch):
         await pilot.press("enter")  # picks it and sends
         await wait_for(pilot, lambda: "/model sonnet" in app.backend.sessions["lead"].prompts)
         assert inp.value == ""
+        # Claude Code answers "Set model to `Sonnet 5.5`": the alias typed is what is
+        # kept (and passed again later), the display name is only shown.
+        lead = app.team.runners["lead"]
+        await wait_for(pilot, lambda: lead.spec.model == "sonnet")
+        assert app.query_one(LeadPanel).model == "Sonnet 5.5"
+        # Each turn's tokens reach the Lead's header: its context and the session total.
+        from collaborators.ui.widgets import usage_text
+        panel = app.query_one(LeadPanel)
+        await wait_for(pilot, lambda: panel.usage is not None and panel.usage.context_tokens)
+        assert panel.usage.context_tokens == lead.usage.context_tokens
+        assert usage_text(panel.usage).plain.startswith(" · ctx ")
+        assert "tok" in usage_text(panel.usage).plain
+        inp.value = "/model default"
+        await pilot.press("enter")
+        await wait_for(pilot, lambda: lead.spec.model == "default")
+        assert app.team.store.load_models() == {"lead": "default"}
 
         # /switch lists the accounts (the one in use last); values from a hint too.
         inp.value = "/switch "

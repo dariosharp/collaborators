@@ -94,6 +94,9 @@ AgentCard:focus, AgentCard:focus-within {
 AgentCard.tester:focus, AgentCard.tester:focus-within {
     border: double $success;
 }
+AgentCard.-compacting {
+    border: round $secondary 40%;
+}
 AgentCard.-waiting {
     border: double $warning;
 }

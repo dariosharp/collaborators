@@ -711,3 +711,67 @@ async def test_remote_control_works_on_a_claude_ai_login_account(tmp_path, monke
     assert team.runners["lead"].session.remote_url is None
     assert any(isinstance(e, Notice) and "turned off" in e.text for e in events)
     await team.shutdown()
+
+
+async def test_default_model_on_resume_and_chosen_model_wins(tmp_path):
+    import json
+    team, events, sessions = make_team(tmp_path, workers=1, testers=0)
+    assert sessions["lead"].spec.model == "default"
+    assert "Claude Code's default model" not in team.status_report()  # Lead not listed
+    team.model_chosen("worker1", "claude-haiku-5-5")
+    assert sessions["worker1"].spec.model == "claude-haiku-5-5"
+    assert "worker1 [claude-haiku-5-5, effort medium, ctx ?]" in team.status_report()
+    # A Lead saved with the old built-in default is not pinned to it on --resume.
+    saved = json.loads(team.store.team_file.read_text())
+    saved["agents"]["lead"]["model"] = "claude-fable-5-2"
+    team.store.team_file.write_text(json.dumps(saved))
+    again, _, sessions2 = make_team(tmp_path, workers=1, testers=0, resume=True)
+    assert sessions2["lead"].spec.model == "default"
+    assert sessions2["worker1"].spec.model == "claude-haiku-5-5"  # the user's /model
+    assert sessions2["lead"].spec.resume and sessions2["worker1"].spec.resume
+    # Removing the agent forgets its choice: a new worker1 is on the configured model.
+    await again.remove_agent("worker1")
+    assert "worker1" not in again.store.load_models()
+
+
+async def test_added_agent_on_the_default_model_reads_well(tmp_path):
+    team, events, sessions = make_team(tmp_path, workers=1, testers=0)
+    from dataclasses import replace
+
+    from collaborators.config import RoleConfig
+    team.cfg = replace(team.cfg, roles={**team.cfg.roles,
+                                        "tester": RoleConfig("default", "low")})
+    name = await team.add_agent("tester")
+    assert any(f"{name} (tester, Claude Code's default model, effort low)" in a
+               for a in team._announcements)
+    assert f"{name} [Claude Code's default model, effort low, ctx ?]" in team.status_report()
+    await team.shutdown()
+
+
+def test_model_from_switch_keeps_what_claude_code_accepts():
+    from collaborators.ui.team_view import model_from_switch
+    assert model_from_switch("default", "Opus 5.5 (default)") == "default"
+    assert model_from_switch(None, "Opus 5.5 (default)") == "default"
+    assert model_from_switch("opus", "Opus 5.5") == "opus"
+    assert model_from_switch("claude-opus-5-5", "Opus 5.5") == "claude-opus-5-5"
+    assert model_from_switch(None, "claude-haiku-5-5") == "claude-haiku-5-5"
+    assert model_from_switch(None, "Opus 5.5") is None  # a display name: nothing to keep
+
+
+async def test_saved_display_name_is_ignored_on_resume(tmp_path):
+    import json
+    team, events, sessions = make_team(tmp_path, workers=1, testers=0)
+    team.model_chosen("lead", "Opus 5.5 (default)")  # never stored: not a model id
+    assert sessions["lead"].spec.model == "default" and not team.store.load_models()
+    team.model_chosen("worker1", "opus")
+    # A state file written by the earlier version, with a display name for the Lead.
+    saved = json.loads(team.store.team_file.read_text())
+    saved["agents"]["lead"].update(model="Opus 5.5 (default)", model_chosen=True)
+    team.store.team_file.write_text(json.dumps(saved))
+    assert team.store.load_models() == {"worker1": "opus"}
+    again, _, sessions2 = make_team(tmp_path, workers=1, testers=0, resume=True)
+    assert sessions2["lead"].spec.model == "default"  # the config's, healed
+    assert sessions2["worker1"].spec.model == "opus"
+    again._save_sessions()
+    assert json.loads(again.store.team_file.read_text())["agents"]["lead"]["model"] \
+        == "default"

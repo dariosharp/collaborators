@@ -164,12 +164,15 @@ Defaults:
 
 | Role | Model | Effort |
 |---|---|---|
-| Lead | `claude-fable-5-2` | medium |
+| Lead | `default` (Claude Code's default model) | medium |
 | Worker | `claude-opus-5-5` | medium |
 | Tester | `claude-sonnet-5-5` | medium |
 
 Override them in `~/.config/collaborators/config.toml` (for every project) or
 `<project>/.collab/config.toml` (for one project). Command-line flags win over both.
+`model = "default"` (or `--lead-model default`, `--worker-model default`…) passes no
+model, so Claude Code picks its own: your account's default or your settings. A
+model picked with `/model` while collab runs comes back with `--resume`.
 
 ```toml
 workers = 2
@@ -178,6 +181,12 @@ permission_mode = "bypassPermissions"   # or acceptEdits, default, auto
 ask = false                              # true: approve tool use from the UI
 worktrees = false                        # true: each worker in its own git worktree
 notify = true                            # desktop notification when a long turn ends
+tester_memory = false                    # true: testers keep their conversation
+compact_at = { lead = 300000, worker = 250000, tester = 250000 }  # tokens; 0: never
+report_max_chars = 3000                  # longer reports are cut for the Lead; 0: never
+
+[lead]
+model = "default"                        # Claude Code's own choice
 
 [worker]
 model = "claude-opus-5-5"
@@ -191,6 +200,30 @@ collab --resume       # reopen every agent's previous conversation here
 collab --worktrees    # each worker in its own git worktree; the Lead merges
 collab --remote-control   # reach the Lead from claude.ai/code or your phone too
 ```
+
+### Saving tokens
+
+Every model call re-reads the agent's whole conversation, so a long conversation
+costs on every step. Each header shows the agent's context size (`ctx 137k`,
+yellow from 150k, red from 250k) and its tokens since collab started.
+
+- **Testers start fresh** on every task (`tester_memory = false`): a new
+  conversation, marked "— new session for T12 —" in its log. The Lead is told to
+  make tester tasks self-contained.
+- **Automatic compaction** (`compact_at`): when an agent's context is above its
+  threshold, collab runs `/compact` right after its turn, while the prompt cache
+  is still warm, keeping what matters (for workers: exact file paths and why,
+  signatures touched, conventions and architecture, how to run tests and linters,
+  decisions, pitfalls and open TODOs; afterwards they re-read files before
+  editing; for the Lead: the user's goals, open
+  tasks, what each agent did). It never happens in the middle of a task: only
+  once the task's report has reached the Lead. The agent shows "compacting…"; a
+  task sent to it meanwhile waits. Its log says e.g. "Compacted: 137k → 18k". The `tester`
+  value only matters with `tester_memory = true`.
+- **Short reports:** workers and testers are asked for reports of ~150 words.
+  Every full report is saved in `.collab/reports/<task>.md` (other teams:
+  `.collab/teams/<name>/reports/`); one longer than `report_max_chars` reaches
+  the Lead cut, with a pointer to that file.
 
 > **Permissions:** by default the agents run unattended (`bypassPermissions`) and can
 > edit files and run commands in the project directory. Use it on code you are

@@ -31,6 +31,7 @@ from claude_agent_sdk.types import (
 )
 
 from .agents import AgentSpec, Command, ToolSpec
+from .config import is_default_model
 from .events import (
     Event,
     LimitReached,
@@ -43,6 +44,7 @@ from .events import (
     TurnResult,
 )
 from .prompts import TOOL_PREFIX
+from .usage import TokenUsage, context_of
 
 
 def _text_of(content: Any) -> str:
@@ -87,6 +89,7 @@ class SdkSession:
         self.session_id = spec.session_id
         self._client: ClaudeSDKClient | None = None
         self._cost_so_far = 0.0  # ResultMessage cost is cumulative per client
+        self._turn_context: int | None = None  # input of the turn's last model call
         self._always_allowed: set[str] = set()
         self.commands: list[Command] = []
         self.models: list[tuple[str, str]] = []  # for /model completion
@@ -105,7 +108,6 @@ class SdkSession:
     def _options(self) -> ClaudeAgentOptions:
         spec = self.spec
         kwargs: dict[str, Any] = dict(
-            model=spec.model,
             effort=spec.effort,
             cwd=str(spec.cwd),
             system_prompt={"type": "preset", "preset": "claude_code",
@@ -119,6 +121,8 @@ class SdkSession:
             # The user's and the project's skills, usable by the agent and as /commands.
             skills="all",
         )
+        if not is_default_model(spec.model):
+            kwargs["model"] = spec.model  # else Claude Code picks its own
         if spec.env:
             kwargs["env"] = dict(spec.env)  # the account to run under (see accounts.py)
         if spec.resume:
@@ -187,6 +191,15 @@ class SdkSession:
     async def interrupt(self) -> None:
         if self._client is not None:
             await self._client.interrupt()
+
+    async def context_size(self) -> int | None:
+        """The context's size now, as /context counts it (e.g. right after /compact,
+        before any model call has measured it)."""
+        if self._client is None:
+            return None
+        usage = await self._client.get_context_usage()
+        total = (usage or {}).get("totalTokens")
+        return int(total) if total else None
 
     async def set_remote_control(self, enabled: bool, name: str | None = None) -> str | None:
         """Turn Remote Control on (returns the claude.ai session URL) or off."""
@@ -257,6 +270,7 @@ class SdkSession:
                     self._turn_is_remote = self._local_pending == 0 or _injected(msg)
                     self._idle.clear()
                     last_text = ""
+                    self._turn_context = None
                 if isinstance(msg, StreamEvent):
                     if msg.parent_tool_use_id:  # a subagent's stream; its final blocks show
                         continue
@@ -268,6 +282,10 @@ class SdkSession:
                 elif isinstance(msg, AssistantMessage):
                     if getattr(msg, "error", None) == "rate_limit":
                         self._hit_limit(None, "")
+                    if not msg.parent_tool_use_id:  # a subagent has its own context
+                        ctx = context_of(getattr(msg, "usage", None))
+                        if ctx:
+                            self._turn_context = ctx
                     for block in msg.content:
                         if isinstance(block, TextBlock):
                             last_text = block.text
@@ -334,6 +352,11 @@ class SdkSession:
         text = msg.result or last_text
         if msg.is_error and not text:
             text = f"{msg.subtype}: {errors}" if errors else msg.subtype
+        context = self._turn_context
+        if context is None and (msg.num_turns or 0) <= 1:
+            # One model call: the turn's usage is that call's. (Over several calls it
+            # is their sum, much more than the context.)
+            context = context_of(usage)
         return TurnResult(
             self.spec.name, text, is_error=msg.is_error, subtype=msg.subtype,
             cost_usd=cost, duration_ms=msg.duration_ms, num_turns=msg.num_turns,
@@ -343,6 +366,8 @@ class SdkSession:
             output_tokens=int(usage.get("output_tokens", 0) or 0),
             session_id=msg.session_id,
             limited=self._limited and msg.is_error,
+            usage=TokenUsage.from_api(usage, cost),
+            context_tokens=context,
         )
 
 

@@ -12,12 +12,15 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
+from .usage import AgentUsage, TokenUsage
+
 
 class AgentStatus(StrEnum):
     STARTING = "starting"
     IDLE = "idle"
     RUNNING = "running"
     WAITING = "waiting"  # waiting on a permission decision
+    COMPACTING = "compacting"  # /compact after a turn; new work waits for it
     ERROR = "error"
 
 
@@ -119,6 +122,16 @@ class TurnResult(Event):
     output_tokens: int = 0
     session_id: str | None = None
     limited: bool = False  # stopped because the account hit its usage limit
+    # Every token of the turn, split (input_tokens above counts the cache in), and the
+    # context size at its end: the input of its last model call. None: unknown.
+    usage: TokenUsage | None = None
+    context_tokens: int | None = None
+
+
+@dataclass(frozen=True)
+class UsageChanged(Event):
+    """An agent's context size or token totals changed (a snapshot)."""
+    usage: AgentUsage
 
 
 @dataclass(frozen=True)
@@ -160,6 +173,13 @@ class TaskRecord:
     undone: bool = False
     merged: bool = False  # a worker task whose worktree changes reached the main directory
     limited: bool = False  # stopped because the account hit its usage limit
+    # tokens the task used (cost_usd above) and the agent's context size at its end
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    context_tokens: int | None = None
+    report_file: str = ""  # the full report, relative to the project directory
 
     @property
     def elapsed(self) -> float:
@@ -189,6 +209,10 @@ class TaskRecord:
             "snap_before": self.snap_before, "snap_after": self.snap_after,
             "changed_files": self.changed_files, "overlapped": self.overlapped,
             "undone": self.undone, "merged": self.merged, "limited": self.limited,
+            "input_tokens": self.input_tokens, "output_tokens": self.output_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cache_write_tokens": self.cache_write_tokens,
+            "context_tokens": self.context_tokens, "report_file": self.report_file,
         }
 
 

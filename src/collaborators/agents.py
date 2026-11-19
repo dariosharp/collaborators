@@ -23,8 +23,12 @@ from .events import (
     StatusChanged,
     ToolCall,
     TurnResult,
+    UsageChanged,
     UserPrompt,
 )
+from .usage import AgentUsage, context_from_transcript, fmt_tokens, transcript_path
+
+COMPACT_TIMEOUT_S = 600
 
 Emit = Callable[[Event], None]
 
@@ -109,6 +113,9 @@ class AgentRunner:
         self.task_id: str | None = None
         self.last_touched: list[str] = []
         self.total_cost = 0.0
+        self.usage = AgentUsage()  # context size and token totals since collab started
+        self.compacting = False    # a /compact is running or about to (holds the lock)
+        self._estimating: asyncio.Task[None] | None = None
         self.last_limited = False  # its last turn stopped at the account's usage limit
         self._ran = spec.resume    # its conversation exists, so it can be resumed
         self._attach(session)
@@ -125,6 +132,7 @@ class AgentRunner:
         if isinstance(event, TurnResult):
             self._ran = True
             self.total_cost += event.cost_usd
+            self._account(event)
             if not self.busy:
                 self._set_status(AgentStatus.IDLE)
 
@@ -158,6 +166,36 @@ class AgentRunner:
             self._emit(Notice(self.name, f"{self.name} failed to start: {exc}", "error"))
             raise
         self._set_status(AgentStatus.IDLE)
+        if self.spec.resume and self.usage.context_tokens is None and self._estimating is None:
+            self._estimating = asyncio.create_task(self._estimate_context(),
+                                                   name=f"{self.name}-context")
+
+    def _account(self, result: TurnResult) -> None:
+        """Add a finished turn (ours or one started from claude.ai) to the usage."""
+        u = self.usage
+        if result.usage is not None:
+            u.totals.add(result.usage)
+        else:
+            u.totals.cost_usd += result.cost_usd
+            u.totals.output += result.output_tokens
+        u.turns += 1
+        if result.context_tokens:
+            u.context_tokens, u.estimated = result.context_tokens, False
+        self._emit(UsageChanged(self.name, u.copy()))
+
+    async def _estimate_context(self) -> None:
+        """A resumed conversation's context size, until its first turn says: from the
+        tail of Claude Code's transcript on disk, off the event loop."""
+        def read() -> int | None:
+            path = transcript_path(self.spec.cwd, self.session.session_id, self.spec.env)
+            return context_from_transcript(path) if path else None
+        try:
+            tokens = await asyncio.to_thread(read)
+        except Exception:
+            return
+        if tokens and self.usage.context_tokens is None:
+            self.usage.context_tokens, self.usage.estimated = tokens, True
+            self._emit(UsageChanged(self.name, self.usage.copy()))
 
     async def run(self, prompt: str, task_id: str | None = None) -> TurnResult:
         async with self._lock:
@@ -193,7 +231,70 @@ class AgentRunner:
             self._ran = True
             self.last_limited = result.limited
             self.total_cost += result.cost_usd
+            self._account(result)
             return result
+
+    async def compact(self, instructions: str,
+                      still_needed: Callable[[], bool] | None = None) -> bool:
+        """`/compact` the conversation, keeping what `instructions` say. Meant for right
+        after a turn, while the prompt cache is warm. Holds the agent meanwhile: work
+        sent to it waits. `still_needed` is checked once the agent is ours (work sent
+        just before may have run first): False skips it. Failures are shown and
+        swallowed. True if it compacted."""
+        self.compacting = True
+        try:
+            async with self._lock:
+                if still_needed is not None and not still_needed():
+                    return False
+                return await self._compact(instructions)
+        finally:
+            self.compacting = False
+
+    async def _compact(self, instructions: str) -> bool:
+        before = self.usage.context_tokens
+        self._set_status(AgentStatus.COMPACTING)
+        result: TurnResult | None = None
+        error = ""
+        try:
+            async with asyncio.timeout(COMPACT_TIMEOUT_S):
+                async for event in self.session.run(f"/compact {instructions}"):
+                    if isinstance(event, TurnResult):
+                        result = event  # the summary itself stays out of the transcript
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        if result is None or result.is_error:
+            error = error or (result.text if result else "no result")
+        if result is not None:
+            # Its tokens count; its context is the one it summarised, not the new one.
+            self._account(replace(result, context_tokens=None))
+        after = None
+        if not error:
+            size = getattr(self.session, "context_size", None)
+            if size is not None:
+                with contextlib.suppress(Exception):
+                    after = await size()
+            self.usage.context_tokens, self.usage.estimated = after, False
+            self._emit(UsageChanged(self.name, self.usage.copy()))
+        self._set_status(AgentStatus.IDLE)
+        was = fmt_tokens(before) if before else "?"
+        if error:
+            self._emit(Notice(self.name, f"Compaction failed ({error}); carrying on with "
+                                         f"the full conversation ({was}).", "warning"))
+            return False
+        self._emit(Notice(self.name, f"Compacted: {was} → "
+                                     f"{fmt_tokens(after) if after else '?'}"))
+        return True
+
+    async def start_fresh(self, backend: Backend, session_id: str, note: str) -> None:
+        """Begin a new conversation (a new session id, nothing resumed): e.g. a tester,
+        which needs no memory of earlier tasks. `note` marks the break in the UI."""
+        await self.reconnect(backend, session_id=session_id, resume=False)
+        self._ran = False
+        self.usage.context_tokens, self.usage.estimated = None, False
+        self._emit(UsageChanged(self.name, self.usage.copy()))
+        self._emit(Notice(self.name, note))
 
     async def reconnect(self, backend: Backend, **changes: Any) -> None:
         """Start a new session for the same conversation with `changes` to the spec
@@ -201,8 +302,9 @@ class AgentRunner:
         if self.busy:
             self._emit(Notice(self.name, f"{self.name} switches account when this turn ends"))
         async with self._lock:
-            self.spec = replace(self.spec, session_id=self.session.session_id,
-                                resume=self._ran, **changes)
+            fields: dict[str, Any] = {"session_id": self.session.session_id,
+                                      "resume": self._ran, **changes}
+            self.spec = replace(self.spec, **fields)
             old, self.session = self.session, backend(self.spec)
             self._attach(self.session)
             with contextlib.suppress(Exception):
@@ -215,4 +317,6 @@ class AgentRunner:
             await self.session.interrupt()
 
     async def close(self) -> None:
+        if self._estimating is not None:
+            self._estimating.cancel()
         await self.session.close()
